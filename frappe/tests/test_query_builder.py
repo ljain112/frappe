@@ -7,7 +7,7 @@ from pypika.functions import Cast
 import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.database.operator_map import func_in
-from frappe.query_builder import Case
+from frappe.query_builder import BooleanValue, Case
 from frappe.query_builder.builder import Function
 from frappe.query_builder.custom import ConstantColumn
 from frappe.query_builder.functions import (
@@ -642,6 +642,21 @@ class TestParameterization(IntegrationTestCase):
 
 		query, _ = frappe.qb.update(DocType).set(DocType.is_submittable, False).walk()
 		self.assertIn("=0", query)
+
+	def test_boolean_value_stays_a_predicate(self):
+		# a constant in a boolean expression is not a value: postgres rejects `OR 0` with
+		# "argument of OR must be type boolean", so BooleanValue keeps it a real boolean
+		DocType = frappe.qb.DocType("DocType")
+
+		query = (
+			frappe.qb.from_(DocType)
+			.select(DocType.name)
+			.where((DocType.istable == 1) | BooleanValue(True))
+			.get_sql()
+		)
+		self.assertIn("true", query)
+
+		self.assertEqual(BooleanValue(False).get_sql(), "false")
 
 	def test_where_conditions_functions(self):
 		DocType = frappe.qb.DocType("DocType")

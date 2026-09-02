@@ -3,7 +3,7 @@ from typing import Any
 
 from pypika.dialects import SQLLiteValueWrapper
 from pypika.queries import QueryBuilder
-from pypika.terms import Criterion, Function, ValueWrapper
+from pypika.terms import Criterion, Function, LiteralValue, ValueWrapper
 from pypika.utils import format_alias_sql
 
 import frappe
@@ -64,6 +64,9 @@ class ParameterizedValueWrapper(ValueWrapper):
 			elif isinstance(self.value, datetime):
 				self.value = frappe.db.format_datetime(self.value)
 			elif isinstance(self.value, bool):
+				# a Check field is stored as an integer, and postgres will neither assign nor
+				# compare a boolean against it. Where a real predicate is wanted instead
+				# (`... OR <literal>`), postgres rejects the integer: use BooleanValue there.
 				self.value = int(self.value)
 
 			sql = self.get_value_sql(
@@ -77,6 +80,18 @@ class ParameterizedValueWrapper(ValueWrapper):
 
 class SQLiteParameterizedValueWrapper(ParameterizedValueWrapper, SQLLiteValueWrapper):
 	pass
+
+
+class BooleanValue(LiteralValue):
+	"""A SQL boolean literal: `true` / `false`.
+
+	ParameterizedValueWrapper renders a Python bool as 1/0, which is what a Check field needs.
+	A boolean expression needs the opposite -- postgres rejects `WHERE ... OR 0` with
+	"argument of OR must be type boolean" -- so wrap the constant in this instead.
+	"""
+
+	def __init__(self, value: bool, alias: str | None = None) -> None:
+		super().__init__("true" if value else "false", alias=alias)
 
 
 class ParameterizedFunction(Function):
