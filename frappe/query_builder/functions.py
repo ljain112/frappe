@@ -16,7 +16,7 @@ from frappe.query_builder.custom import (
 	Quarter,
 	Year,
 )
-from frappe.query_builder.utils import ImportMapper, db_type_is
+from frappe.query_builder.utils import DialectTerm, ImportMapper, db_type_is
 
 from .utils import PseudoColumn
 
@@ -41,7 +41,17 @@ class Instr(Function):
 		super().__init__("INSTR", haystack, needle, **kwargs)
 
 
-Locate = ImportMapper({db_type_is.MARIADB: Locate, db_type_is.POSTGRES: Strpos, db_type_is.SQLITE: Instr})
+class Locate(DialectTerm, Locate):
+	"""LOCATE(needle, haystack), in each backend's own spelling."""
+
+	def as_postgres(self, **kwargs):
+		return Strpos(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	# DuckDB has no LOCATE; strpos is the postgres spelling and works unchanged
+	as_duckdb = as_postgres
+
+	def as_sqlite(self, **kwargs):
+		return Instr(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
 # for backward compatibility
@@ -93,9 +103,43 @@ class CurDate(Term):
 		return "CURRENT_DATE"
 
 
-GroupConcat = ImportMapper({db_type_is.MARIADB: GROUP_CONCAT, db_type_is.POSTGRES: STRING_AGG})
+class GroupConcat(DialectTerm, GROUP_CONCAT):
+	"""GROUP_CONCAT, rendered as STRING_AGG where that is the spelling.
 
-Match = ImportMapper({db_type_is.MARIADB: MATCH, db_type_is.POSTGRES: TO_TSVECTOR})
+	MySQL puts the delimiter in a SEPARATOR clause and postgres takes it as a second argument,
+	so the separator travels on the term and each rendering places it itself.
+	"""
+
+	def as_postgres(self, **kwargs):
+		term = STRING_AGG(self.args[0], self._separator, alias=self.alias)
+		# `.distinct()` is a @builder method, so its state lives on the term this replaces and has
+		# to travel with it -- dropping it silently widens the result instead of failing
+		term._distinct = self._distinct
+		return term.get_sql(**kwargs)
+
+	# SEPARATOR is MySQL syntax; DuckDB takes the postgres form
+	as_duckdb = as_postgres
+
+
+class Match(DialectTerm, MATCH):
+	"""Full-text search, which not every backend has.
+
+	Frappe does not implement sqlite search through the query builder either -- see
+	`frappe.search.sqlite_search.SQLiteSearch`, which maintains a dedicated FTS5 side-car index.
+	DuckDB is in the same position: it has neither MATCH ... AGAINST nor to_tsvector, so this
+	refuses rather than returning wrong rows.
+	"""
+
+	def as_postgres(self, **kwargs):
+		return TO_TSVECTOR(self.args[0], alias=self.alias).Against(self._Against).get_sql(**kwargs)
+
+	def as_duckdb(self, **kwargs):
+		from frappe import _, throw
+
+		throw(
+			_("Full-text search is not available on a snapshot report."),
+			title=_("Unsupported Query"),
+		)
 
 
 class _PostgresTimestamp(ArithmeticExpression):
@@ -111,19 +155,31 @@ class _PostgresTimestamp(ArithmeticExpression):
 		super().__init__(operator=Arithmetic.add, left=datepart, right=timepart, alias=alias)
 
 
-CombineDatetime = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("TIMESTAMP", ["date", "time"]),
-		db_type_is.POSTGRES: _PostgresTimestamp,
-	}
-)
+class CombineDatetime(DialectTerm, Function):
+	"""TIMESTAMP(date, time); postgres and DuckDB add the two parts instead."""
 
-DateFormat = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("DATE_FORMAT", ["date", "format"]),
-		db_type_is.POSTGRES: ToChar,
-	}
-)
+	def __init__(self, date, time, alias=None):
+		super().__init__("TIMESTAMP", date, time, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _PostgresTimestamp(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	# TIMESTAMP(date, time) is a parser error on DuckDB; date + time is not
+	as_duckdb = as_postgres
+
+
+class DateFormat(DialectTerm, Function):
+	"""DATE_FORMAT(date, format), in each backend's own spelling."""
+
+	def __init__(self, date, format, alias=None):
+		super().__init__("DATE_FORMAT", date, format, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return ToChar(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	def as_duckdb(self, **kwargs):
+		# DuckDB has neither to_char nor date_format; strftime takes the same % codes as mariadb
+		return Function("strftime", *self.args, alias=self.alias).get_sql(**kwargs)
 
 
 class YearWeek(Function):
@@ -151,12 +207,17 @@ class _PostgresUnixTimestamp(Extract):
 		return sql
 
 
-UnixTimestamp = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("unix_timestamp", ["date"]),
-		db_type_is.POSTGRES: _PostgresUnixTimestamp,
-	}
-)
+class UnixTimestamp(DialectTerm, Function):
+	"""unix_timestamp(date); elsewhere an epoch extraction."""
+
+	def __init__(self, date, alias=None):
+		super().__init__("unix_timestamp", date, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _PostgresUnixTimestamp(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	# DuckDB has no unix_timestamp either, and the postgres epoch expression works there
+	as_duckdb = as_postgres
 
 
 class _PostgresDateDiff(ArithmeticExpression):
@@ -174,12 +235,17 @@ class _PostgresDateDiff(ArithmeticExpression):
 		)
 
 
-DateDiff = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("DATEDIFF", ["date1", "date2"]),
-		db_type_is.POSTGRES: _PostgresDateDiff,
-	}
-)
+class DateDiff(DialectTerm, Function):
+	"""DATEDIFF(date1, date2); postgres and DuckDB subtract the two dates instead."""
+
+	def __init__(self, date1, date2, alias=None):
+		super().__init__("DATEDIFF", date1, date2, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _PostgresDateDiff(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	# DATEDIFF() does not resolve on DuckDB; date - date does
+	as_duckdb = as_postgres
 
 
 class _MariaDBJSONExtract(Function):
@@ -205,6 +271,7 @@ JSONExtract = ImportMapper(
 	{
 		db_type_is.MARIADB: _MariaDBJSONExtract,
 		db_type_is.POSTGRES: lambda field, path, **kw: field.get_json_value(path),
+		db_type_is.DUCKDB: lambda field, path, **kw: field.get_json_value(path),
 	}
 )
 
@@ -212,6 +279,7 @@ JSONValue = ImportMapper(
 	{
 		db_type_is.MARIADB: _MariaDBJSONValue,
 		db_type_is.POSTGRES: lambda field, path, **kw: field.get_text_value(path),
+		db_type_is.DUCKDB: lambda field, path, **kw: field.get_text_value(path),
 	}
 )
 
@@ -219,6 +287,7 @@ JSONContains = ImportMapper(
 	{
 		db_type_is.MARIADB: _MariaDBJSONContains,
 		db_type_is.POSTGRES: lambda target, candidate, **kw: target.contains(candidate),
+		db_type_is.DUCKDB: lambda target, candidate, **kw: Function("json_contains", target, candidate),
 	}
 )
 

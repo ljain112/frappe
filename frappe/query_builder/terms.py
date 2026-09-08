@@ -37,6 +37,24 @@ class NamedParameterWrapper:
 		return self.parameters
 
 
+class DuckDBParameterWrapper(NamedParameterWrapper):
+	"""Collect parameters for DuckDB, which rejects pyformat placeholders.
+
+	DuckDB's parser errors on `%(param1)s` and on a bare `%s`; its named-parameter
+	spelling is `$param1`, bound from a dict. Keys and values are otherwise identical
+	to `NamedParameterWrapper` -- `ParameterizedValueWrapper` calls `get_value_sql()`
+	without `secondary_quote_char`, so values arrive unquoted either way.
+	"""
+
+	__slots__ = ()
+
+	def get_sql(self, param_value: Any, **kwargs) -> str:
+		param_key = f"param{len(self.parameters) + 1}"
+		assert param_key not in self.parameters, "generated parameter keys must be unique"
+		self.parameters[param_key] = param_value
+		return f"${param_key}"
+
+
 class ParameterizedValueWrapper(ValueWrapper):
 	"""
 	Class to monkey patch ValueWrapper

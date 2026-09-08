@@ -229,7 +229,7 @@ class Report(Document):
 		return res
 
 	def get_module_method(self, method):
-		if method not in ("execute", "execute_snapshot_report", "get_xlsx_styles"):
+		if method not in ("execute", "get_xlsx_styles"):
 			raise Exception("Unknown report method")
 
 		module = self.module or frappe.db.get_value("DocType", self.ref_doctype, "module")
@@ -250,11 +250,17 @@ class Report(Document):
 			return self.get_columns(), loc["result"]
 
 	def execute_snapshot_report(self, filters):
-		try:
-			execute_snapshot_report = self.get_module_method("execute_snapshot_report")
-		except AttributeError:
-			return [], []
-		return execute_snapshot_report(frappe._dict(filters))
+		"""Run the report's normal `execute()` against its synced DuckDB snapshots.
+
+		The report keeps a single implementation: inside `snapshot()`, query builder reads of
+		a synced doctype are routed to its DuckDB file and everything else -- master data,
+		`frappe.db`, `frappe.get_all` -- still goes to the site database. Reports do not need
+		(and no longer get) a separate `execute_snapshot_report` entry point.
+		"""
+		from frappe.database.duckdb.database import snapshot
+
+		with snapshot([d.doc_type for d in self.doctype_to_sync]):
+			return self.execute_module(filters)
 
 	def get_data(
 		self,

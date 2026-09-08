@@ -28,6 +28,7 @@ from frappe.model.base_document import DOCTYPES_FOR_DOCTYPE
 from frappe.model.document import Document
 from frappe.query_builder import Criterion, Field, Order, functions
 from frappe.query_builder.custom import Month, MonthName, Quarter, Year
+from frappe.query_builder.utils import requires_strict_group_by
 
 CORE_DOCTYPES = DOCTYPES_FOR_DOCTYPE | frozenset(
 	(
@@ -263,6 +264,11 @@ class Engine:
 		self.is_mariadb = db_type == "mariadb"
 		self.is_postgres = db_type == "postgres"
 		self.is_sqlite = db_type == "sqlite"
+		# An alternate read target may enforce GROUP BY more strictly than the site database does
+		# (a snapshot re-renders this query for DuckDB, which is as strict as postgres while
+		# mariadb is not). Building under the strict rules produces SQL that is valid on either,
+		# so the query keeps working wherever it is finally run.
+		self.strict_group_by = requires_strict_group_by()
 		self.user = user or frappe.session.user
 		self.parent_doctype = parent_doctype
 		self.reference_doctype = reference_doctype
@@ -1314,7 +1320,7 @@ class Engine:
 
 	def apply_group_by(self, group_by: str | None = None):
 		parsed_group_by_fields = self._validate_group_by(group_by)
-		if self.is_postgres and self._is_main_table_pk_group_by(parsed_group_by_fields):
+		if self.strict_group_by and self._is_main_table_pk_group_by(parsed_group_by_fields):
 			parsed_group_by_fields += self._joined_link_table_pks()
 		self._grouped_queries = {
 			f.get_sql() if hasattr(f, "get_sql") else str(f) for f in parsed_group_by_fields
@@ -1352,7 +1358,7 @@ class Engine:
 
 		parsed_order_fields = self._validate_order_by(order_by)
 		for order_field, order_direction in parsed_order_fields:
-			if self.is_postgres and self.is_aggregate_query:
+			if self.strict_group_by and self.is_aggregate_query:
 				self.query = self.query.orderby(
 					self._normalize_postgres_order_field(order_field), order=order_direction
 				)
@@ -1415,7 +1421,7 @@ class Engine:
 						order_direction = Order.desc if spec_order == "desc" else Order.asc
 					else:
 						order_direction = Order.asc if spec_order == "asc" else Order.desc
-					if self.is_postgres and self.is_aggregate_query:
+					if self.strict_group_by and self.is_aggregate_query:
 						self.query = self.query.orderby(
 							self._normalize_postgres_order_field(field), order=order_direction
 						)
@@ -1427,7 +1433,7 @@ class Engine:
 				order_direction = Order.desc if sort_order.lower() == "desc" else Order.asc
 			else:
 				order_direction = Order.asc if sort_order.lower() == "asc" else Order.desc
-			if self.is_postgres and self.is_aggregate_query:
+			if self.strict_group_by and self.is_aggregate_query:
 				self.query = self.query.orderby(
 					self._normalize_postgres_order_field(field), order=order_direction
 				)

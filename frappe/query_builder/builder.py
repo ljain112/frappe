@@ -101,6 +101,10 @@ class RecursiveSQLLiteQueryBuilder(RecursiveCTEMixin, SQLLiteQueryBuilder):
 	pass
 
 
+class RecursiveDuckDBQueryBuilder(RecursiveCTEMixin, PostgreSQLQueryBuilder):
+	pass
+
+
 class MariaDB(Base, MySQLQuery):
 	Field = terms.Field
 
@@ -162,6 +166,30 @@ class SQLite(Base, SQLLiteQuery):
 	@classmethod
 	def _builder(cls, *args, **kwargs) -> "RecursiveSQLLiteQueryBuilder":
 		return RecursiveSQLLiteQueryBuilder(*args, wrapper_cls=SQLiteParameterizedValueWrapper, **kwargs)
+
+	@classmethod
+	def from_(cls, table, *args, **kwargs):
+		if isinstance(table, str):
+			table = cls.DocType(table)
+		return super().from_(table, *args, **kwargs)
+
+
+class DuckDB(Base, PostgreSQLQuery):
+	"""DuckDB reads as a postgres dialect: double-quoted identifiers, and the postgres
+	spelling of most functions (see the DUCKDB entries in `query_builder.functions`).
+
+	Snapshot queries are built with the site's own dialect and re-rendered for DuckDB at
+	execution time, so this class is not what report code builds against; it supplies the
+	quoting and the `db_type_is.DUCKDB` mapping that rendering resolves through.
+	"""
+
+	Field = terms.Field
+
+	_BuilderClasss = RecursiveDuckDBQueryBuilder
+
+	@classmethod
+	def _builder(cls, *args, **kwargs) -> "RecursiveDuckDBQueryBuilder":
+		return RecursiveDuckDBQueryBuilder(*args, wrapper_cls=ParameterizedValueWrapper, **kwargs)
 
 	@classmethod
 	def from_(cls, table, *args, **kwargs):

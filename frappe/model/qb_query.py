@@ -4,6 +4,7 @@
 
 import copy
 import json
+from contextlib import nullcontext
 from typing import Any
 
 import frappe
@@ -48,6 +49,7 @@ class DatabaseQuery:
 		save_user_settings: bool = False,
 		save_user_settings_fields: bool = False,
 		update: dict[str, Any] | None = None,
+		snapshot: bool = False,
 		user_settings: str | dict[str, Any] | None = None,
 		reference_doctype: str | None = None,
 		run: bool = True,
@@ -210,16 +212,26 @@ class DatabaseQuery:
 			"db_query_compat": True,
 		}
 
-		query = frappe.qb.get_query(**kwargs)
+		# `Engine` reads the active snapshot while it builds (to apply the stricter GROUP BY
+		# rules) and `run()` reads it again to pick the connection, so both go inside the block.
+		if snapshot:
+			from frappe.database.duckdb.database import snapshot as use_snapshot
 
-		if not run:
-			return query
-
-		# Run the query
-		if pluck:
-			result = query.run(debug=debug, as_dict=True, pluck=pluck)
+			reading_snapshot = use_snapshot([self.doctype])
 		else:
-			result = query.run(debug=debug, as_dict=not as_list, update=update)
+			reading_snapshot = nullcontext()
+
+		with reading_snapshot:
+			query = frappe.qb.get_query(**kwargs)
+
+			if not run:
+				return query
+
+			# Run the query
+			if pluck:
+				result = query.run(debug=debug, as_dict=True, pluck=pluck)
+			else:
+				result = query.run(debug=debug, as_dict=not as_list, update=update)
 
 		# Add comment count if requested and not as_list
 		if sbool(with_comment_count) and not as_list and self.doctype:
