@@ -18,6 +18,7 @@ class SystemSettings(Document):
 	from typing import TYPE_CHECKING
 
 	if TYPE_CHECKING:
+		from frappe.core.doctype.doctype_to_sync.doctype_to_sync import DoctypeToSync
 		from frappe.types import DF
 
 		allow_clearing_link_fields: DF.Check
@@ -50,6 +51,7 @@ class SystemSettings(Document):
 		disable_standard_email_footer: DF.Check
 		disable_system_update_notification: DF.Check
 		disable_user_pass_login: DF.Check
+		doctype_to_sync: DF.Table[DoctypeToSync]
 		document_share_key_expiry: DF.Int
 		dormant_days: DF.Int
 		email_footer_address: DF.SmallText | None

@@ -172,21 +172,11 @@ def generate_report_result(
 		"execution_time": execution_time or 0,
 	}
 
-	if report.snapshot_report and report.doctype_to_sync:
-		if latest_sync := frappe.db.get_all(
-			"DuckDB Sync",
-			filters={"doc_type": report.doctype_to_sync[0].doc_type, "docstatus": 1},
-			fields=["creation"],
-			pluck="creation",
-			order_by="creation desc",
-			limit=1,
-		):
-			return_dict.update(
-				{
-					"snapshot_report": True,
-					"snapshot_at": latest_sync[0],
-				}
-			)
+	if report.snapshot_report:
+		from frappe.database.duckdb.database import snapshot_taken_at
+
+		if taken_at := snapshot_taken_at():
+			return_dict.update({"snapshot_report": True, "snapshot_at": taken_at})
 
 	return return_dict
 

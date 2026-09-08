@@ -113,6 +113,7 @@
   "sync_in_batch",
   "frequency",
   "sync_timeout",
+  "doctype_to_sync",
   "background_workers",
   "enable_scheduler",
   "dormant_days",
@@ -799,7 +800,7 @@
   },
   {
    "default": "0",
-   "description": "Adds a clear (\u00d7) button to Link fields, allowing users to quickly remove the selected value.",
+   "description": "Adds a clear (×) button to Link fields, allowing users to quickly remove the selected value.",
    "fieldname": "allow_clearing_link_fields",
    "fieldtype": "Check",
    "label": "Allow Clearing Link Fields"
@@ -850,6 +851,14 @@
    "fieldtype": "Int",
    "label": "Max Zip Extract Size (MB)",
    "non_negative": 1
+  },
+  {
+   "depends_on": "eval: doc.enable_snapshot_reports",
+   "description": "Doctypes replicated to DuckDB for snapshot reports. Set once here rather than on every report.",
+   "fieldname": "doctype_to_sync",
+   "fieldtype": "Table",
+   "label": "Doctype To Sync",
+   "options": "Doctype To Sync"
   }
  ],
  "icon": "fa fa-cog",

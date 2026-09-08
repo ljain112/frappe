@@ -25,7 +25,6 @@
   "add_translate_data",
   "timeout",
   "section_break_tljw",
-  "doctype_to_sync",
   "filters_section",
   "filters",
   "columns_section",
@@ -240,13 +239,6 @@
   {
    "fieldname": "section_break_tljw",
    "fieldtype": "Section Break"
-  },
-  {
-   "depends_on": "eval: doc.snapshot_report",
-   "fieldname": "doctype_to_sync",
-   "fieldtype": "Table",
-   "label": "Doctype To Sync",
-   "options": "Doctype To Sync"
   },
   {
    "default": "0",

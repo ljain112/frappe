@@ -102,12 +102,12 @@ def get_latest_sync(doctype: str | None = None, read_only: bool = False):
 	Pass `read_only` for reads. DuckDB allows several processes on one file only while they are
 	all read-only, so a read-write handle would make two concurrent reports collide.
 	"""
-	filename = latest_sync_filename(doctype)
-	return get_duckdb(read_only, filename) if filename else None
+	sync = latest_completed_sync(doctype)
+	return get_duckdb(read_only, sync.filename) if sync else None
 
 
-def latest_sync_filename(doctype: str | None = None) -> str | None:
-	"""Filename of the most recent completed sync of `doctype`, or None. See `get_latest_sync`."""
+def latest_completed_sync(doctype: str | None = None):
+	"""The most recent completed `DuckDB Sync` for `doctype`, or None. See `get_latest_sync`."""
 	if not doctype:
 		return None
 
@@ -115,16 +115,16 @@ def latest_sync_filename(doctype: str | None = None) -> str | None:
 	item = frappe.qb.DocType("DuckDB Sync Item")
 	loading = frappe.qb.from_(item).select(item.parent).where(item.synced == 0)
 
-	filename = (
+	completed = (
 		frappe.qb.from_(sync)
-		.select(sync.filename)
+		.select(sync.filename, sync.creation)
 		.where((sync.doc_type == doctype) & (sync.docstatus == 1) & sync.name.notin(loading))
 		.orderby(sync.creation, order=Order.desc)
 		.limit(1)
-		.run(pluck=True)
+		.run(as_dict=True)
 	)
 
-	return filename[0] if filename else None
+	return completed[0] if completed else None
 
 
 @contextmanager
@@ -150,8 +150,8 @@ def snapshot(doctypes: list[str]):
 	# so a query joining two synced doctypes is served here instead of falling back.
 	files = {}
 	for doctype in doctypes:
-		if filename := latest_sync_filename(doctype):
-			files[frappe.scrub(doctype)] = duckdb_file_path(filename)
+		if sync := latest_completed_sync(doctype):
+			files[frappe.scrub(doctype)] = duckdb_file_path(sync.filename)
 
 	conn = None
 	targets = []
@@ -164,6 +164,7 @@ def snapshot(doctypes: list[str]):
 			conn.execute(f"""ATTACH '{path.replace("'", "''")}' AS "{alias}" (READ_ONLY)""")
 
 		conn.execute("SET search_path='{}'".format(",".join(files)))
+		apply_duckdb_limits(conn)
 		tables = {row[0] for row in conn.sql("show tables").fetchall()}
 		targets.append(DuckDBSnapshotTarget(conn, tables))
 
@@ -223,30 +224,60 @@ class DuckDBRelation:
 		]
 
 
-def start_duckdb_sync():
-	_dt = qb.DocType("Doctype To Sync")
-	to_sync = (
-		qb.from_(_dt)
-		.select(_dt.doc_type)
-		.distinct()
-		.where(_dt.parenttype.eq("Report") & _dt.parentfield.eq("doctype_to_sync"))
-		.run(pluck="doc_type")
+def apply_duckdb_limits(conn, writing: bool = False):
+	"""Bound what one DuckDB connection may take from a shared frappe process.
+
+	DuckDB otherwise uses every core and up to ~80% of system memory, and it recommends capping
+	both when it shares a machine with other work -- which a gunicorn or RQ worker always does.
+	These are per-machine resource limits rather than product settings, so they come from
+	`site_config.json` (`duckdb_threads`, `duckdb_memory_limit`) alongside the other tuning knobs,
+	and are left at DuckDB's defaults when unset.
+	"""
+	if threads := frappe.conf.get("duckdb_threads"):
+		conn.execute(f"SET threads = {int(threads)}")
+
+	if memory_limit := frappe.conf.get("duckdb_memory_limit"):
+		conn.execute("SET memory_limit = '{}'".format(str(memory_limit).replace("'", "")))
+
+	if writing:
+		# documented for queries that write a lot of data; the sync does not depend on the order
+		# rows land in, and it lets DuckDB keep peak memory down while loading
+		conn.execute("SET preserve_insertion_order = false")
+
+
+def doctypes_to_sync() -> list[str]:
+	"""Doctypes replicated to DuckDB, declared once in System Settings.
+
+	A report only says *that* it is a snapshot report; which doctypes are replicated is a
+	site-level operational choice (it depends on data volume), so it is not repeated per report.
+	"""
+	return frappe.get_all(
+		"Doctype To Sync",
+		filters={"parenttype": "System Settings", "parentfield": "doctype_to_sync"},
+		pluck="doc_type",
+		distinct=True,
 	)
-	for x in to_sync:
-		doc = frappe.get_doc(
-			{
-				"doctype": "DuckDB Sync",
-				"doc_type": x,
-			}
-		).insert()
-		doc.submit()
+
+
+def snapshot_taken_at():
+	"""When the data a snapshot report reads was captured, or None if nothing is ready.
+
+	A report reads every synced doctype, so it is only as fresh as the *stalest* of them.
+	"""
+	times = [sync.creation for dt in doctypes_to_sync() if (sync := latest_completed_sync(dt))]
+	return min(times) if times else None
+
+
+def start_duckdb_sync():
+	for doctype in doctypes_to_sync():
+		frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": doctype}).insert().submit()
 
 
 class DuckDBSnapshotTarget:
-	"""One synced `.duckdb` file, offered to the query builder as a place to read from.
+	"""The synced snapshots, offered to the query builder as a place to read from.
 
 	This is the whole of what `frappe.query_builder` knows about DuckDB: it asks `can_serve`
-	whether a query's tables live here, renders for `dialect`, hands the SQL to `execute`, and
+	whether a query's tables are here, renders for `dialect`, hands the SQL to `execute`, and
 	treats `fallback_errors` as "this target cannot answer, use the site database".
 	"""
 
@@ -264,7 +295,7 @@ class DuckDBSnapshotTarget:
 		return (duckdb.CatalogException, duckdb.BinderException)
 
 	def can_serve(self, tables: set[str]) -> bool:
-		"""A snapshot holds one doctype plus its child tables, so anything else falls back."""
+		"""The snapshots hold the synced doctypes, so anything else falls back."""
 		return tables <= self.tables
 
 	def execute(self, sql, params, columns=None, **kwargs):

@@ -7,7 +7,7 @@ import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.core.doctype.duckdb_sync.duckdb_sync import sync_data_to_duckdb
 from frappe.database import delete_duckdb_file
-from frappe.database.duckdb.database import snapshot
+from frappe.database.duckdb.database import doctypes_to_sync, snapshot, snapshot_taken_at
 from frappe.query_builder.functions import DateFormat, GroupConcat, Match, Sum
 from frappe.query_builder.utils import db_type_is, get_query_target, prepare_query
 from frappe.tests import IntegrationTestCase
@@ -219,6 +219,31 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 			# and it really was the snapshot, not a fallback
 			self.assertIsNotNone(get_query_target(query()))
 			self.assertIn("tabRole", targets[0].tables)
+
+	def test_report_runner_uses_the_site_wide_sync_list(self):
+		"""A report only flags itself as a snapshot report; the doctypes come from System Settings."""
+		settings = frappe.get_single("System Settings")
+		before = [row.doc_type for row in settings.doctype_to_sync]
+		settings.append("doctype_to_sync", {"doc_type": self.doctype})
+		settings.flags.ignore_validate = True
+		settings.save(ignore_permissions=True)
+		self.addCleanup(frappe.clear_cache)
+
+		try:
+			self.assertIn(self.doctype, doctypes_to_sync())
+			self.assertIsNotNone(snapshot_taken_at(), "a completed sync should date the snapshot")
+
+			# what Report.execute_snapshot_report does, without needing a report on disk
+			dt = self.table()
+			expected = frappe.qb.from_(dt).select(dt.name).orderby(dt.name).run()
+			with snapshot(doctypes_to_sync()):
+				self.assertIsNotNone(get_query_target(frappe.qb.from_(dt).select(dt.name)))
+				self.assertEqual(expected, frappe.qb.from_(dt).select(dt.name).orderby(dt.name).run())
+		finally:
+			settings = frappe.get_single("System Settings")
+			settings.doctype_to_sync = [r for r in settings.doctype_to_sync if r.doc_type in before]
+			settings.flags.ignore_validate = True
+			settings.save(ignore_permissions=True)
 
 	def test_query_on_unsynced_doctype_falls_back(self):
 		with snapshot([self.doctype]):

@@ -6,6 +6,7 @@ from datetime import time, timedelta
 import frappe
 from frappe import qb
 from frappe.database import get_duckdb
+from frappe.database.duckdb.database import apply_duckdb_limits
 from frappe.database.duckdb.schema import DuckDBTable
 from frappe.model.document import Document
 
@@ -49,7 +50,9 @@ class DuckDBSync(Document):
 		start_data_sync(self.name)
 
 	def get_duckdb_conn(self):
-		return get_duckdb(False, self.filename)
+		conn = get_duckdb(False, self.filename)
+		apply_duckdb_limits(conn, writing=True)
+		return conn
 
 	def sync_schema(self):
 		duck_conn = self.get_duckdb_conn()

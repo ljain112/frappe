@@ -27,7 +27,6 @@ class Report(Document):
 	from typing import TYPE_CHECKING
 
 	if TYPE_CHECKING:
-		from frappe.core.doctype.doctype_to_sync.doctype_to_sync import DoctypeToSync
 		from frappe.core.doctype.has_role.has_role import HasRole
 		from frappe.core.doctype.report_column.report_column import ReportColumn
 		from frappe.core.doctype.report_filter.report_filter import ReportFilter
@@ -40,7 +39,6 @@ class Report(Document):
 		default_print_format: DF.Link | None
 		disable_prepared_report_automation: DF.Check
 		disabled: DF.Check
-		doctype_to_sync: DF.Table[DoctypeToSync]
 		documentation_url: DF.Data | None
 		filters: DF.Table[ReportFilter]
 		generate_csv: DF.Check
@@ -257,9 +255,9 @@ class Report(Document):
 		`frappe.db`, `frappe.get_all` -- still goes to the site database. Reports do not need
 		(and no longer get) a separate `execute_snapshot_report` entry point.
 		"""
-		from frappe.database.duckdb.database import snapshot
+		from frappe.database.duckdb.database import doctypes_to_sync, snapshot
 
-		with snapshot([d.doc_type for d in self.doctype_to_sync]):
+		with snapshot(doctypes_to_sync()):
 			return self.execute_module(filters)
 
 	def get_data(
