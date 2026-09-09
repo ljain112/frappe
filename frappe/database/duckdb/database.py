@@ -1,3 +1,4 @@
+import re
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 
@@ -5,8 +6,12 @@ import frappe
 from frappe.database import duckdb_file_path, get_duckdb
 from frappe.database.database import Database
 from frappe.database.duckdb.schema import DuckDBTable
+from frappe.database.utils import get_doctype_name
 from frappe.query_builder import Order
 from frappe.query_builder.utils import db_type_is
+from frappe.utils import get_table_name
+
+MISSING_TABLE = re.compile(r"Table with name (.+?) does not exist")
 
 
 def get_type_map():
@@ -299,6 +304,10 @@ class DuckDBSnapshotTarget:
 	def __init__(self, conn, tables: set[str]):
 		self.conn = conn
 		self.tables = tables
+		# what the attached snapshot files hold, as opposed to anything registered live later
+		self.snapshot_tables = set(tables)
+		# doctypes `recover` has already tried, so a repeated failure gives up instead of looping
+		self.attempted: set[str] = set()
 
 	@property
 	def fallback_errors(self):
@@ -318,8 +327,16 @@ class DuckDBSnapshotTarget:
 		`filters` bound what is materialised: the caller knows the scope its query will read, and
 		an unbounded master table would land in memory in full. Registering is idempotent, so a
 		second call with a wider scope replaces the first.
+
+		A doctype that is itself synced is left alone. A registered table *shadows* an attached
+		one of the same name, so registering over a snapshot would silently swap frozen rows for
+		live ones for every query in the block -- and the snapshot copy is both consistent with
+		the rest of the report and faster to scan.
 		"""
 		import pyarrow as pa
+
+		if get_table_name(doctype) in self.snapshot_tables:
+			return
 
 		# the arrow schema describes the table as the sync would create it, which can name columns
 		# an unsynced doctype does not actually have; get_valid_columns is what really exists
@@ -339,11 +356,40 @@ class DuckDBSnapshotTarget:
 				if isinstance(value := row.get(name), timedelta):
 					row[name] = (datetime.min + value).time()
 
-		table = f"tab{doctype}"
+		table = get_table_name(doctype)
 		# an explicit schema keeps the column types when there are no matching rows, so a join
 		# against an empty dimension still resolves instead of failing to bind
 		self.conn.register(table, pa.Table.from_pylist(rows, schema=schema))
 		self.tables.add(table)
+
+	def recover(self, error) -> bool:
+		"""Supply a table the query needed and this target did not have, if that is safe.
+
+		The structural check in `get_query_target` only sees `_from` and `_joins`; a dimension
+		reached through a subquery (`ExistsCriterion` hides what it wraps, `RawCriterion` is
+		opaque SQL) is invisible until DuckDB binds the query and says what is missing. Reading
+		that dimension live is what keeps the join here instead of sending the whole query to the
+		site database, and it is bounded by `duckdb_live_table_limit` so an unexpectedly large
+		table falls back rather than landing in memory.
+
+		Returns whether anything changed, i.e. whether retrying is worth it.
+		"""
+		match = MISSING_TABLE.search(str(error))
+		if not match:
+			return False
+
+		doctype = get_doctype_name(match.group(1))
+		if doctype in self.attempted or not frappe.db.exists("DocType", doctype):
+			return False
+
+		self.attempted.add(doctype)
+
+		limit = frappe.conf.get("duckdb_live_table_limit", 100_000)
+		if frappe.db.count(doctype) > limit:
+			return False
+
+		self.attach_live(doctype)
+		return True
 
 	def can_serve(self, tables: set[str]) -> bool:
 		"""The snapshots hold the synced doctypes, so anything else falls back."""

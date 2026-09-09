@@ -342,10 +342,17 @@ def execute_query(query, *args, **kwargs):
 	child_queries = query._child_queries
 
 	target = get_query_target(query)
-	if target is not None:
+	while target is not None:
 		try:
 			result = target.execute(*prepare_query(query, dialect=target.dialect), **kwargs)
-		except target.fallback_errors:
+			break
+		except target.fallback_errors as error:
+			# A target can sometimes supply what it was missing -- a dimension reached through a
+			# subquery, which the table check above cannot see -- so give it the chance to before
+			# giving up on it and sending the whole query to the site database.
+			if target.recover(error):
+				continue
+
 			# Either the target does not hold some table or column this query needs -- the
 			# structural check in get_query_target cannot see an ExistsCriterion subquery or raw
 			# permission SQL -- or the query is legal on the site database but not there. Both

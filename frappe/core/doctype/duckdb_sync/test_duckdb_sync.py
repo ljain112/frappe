@@ -315,34 +315,64 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 			settings.flags.ignore_validate = True
 			settings.save(ignore_permissions=True)
 
-	def test_live_table_keeps_a_master_data_join_in_the_snapshot(self):
-		"""Attaching live rows lets a snapshot join master data without falling back.
+	def answered_by(self, target, run):
+		"""Run `run()` and report how the target fared, since results alone cannot tell."""
+		stats, real = {"duckdb": 0, "failed_bind": 0}, target.execute
 
-		Without it the whole query goes to the site database, so a report that joins its fact
-		table to a dimension -- which is most of them -- gets no acceleration at all.
+		def spy(*args, **kwargs):
+			try:
+				out = real(*args, **kwargs)
+				stats["duckdb"] += 1
+				return out
+			except Exception:
+				stats["failed_bind"] += 1
+				raise
+
+		target.execute = spy
+		try:
+			return stats, run()
+		finally:
+			target.execute = real
+
+	def test_unsynced_dimension_is_attached_automatically(self):
+		"""A join to unsynced master data is served here, without the report asking.
+
+		The dimension is reached through a subquery, which `get_query_target` cannot see, so the
+		bind fails first and the target supplies the table before the retry. Falling back instead
+		would mean a report that joins its fact table to a dimension -- most of them -- gets no
+		acceleration at all.
 		"""
+		from pypika.terms import ExistsCriterion
+
 		dt, role = self.table(), frappe.qb.DocType("Role")
 
 		def query():
-			return (
-				frappe.qb.from_(dt)
-				.join(role)
-				.on(role.name == dt.role)
-				.select(dt.name, role.name.as_("role_name"))
-				.orderby(dt.name)
-			)
+			exists = frappe.qb.from_(role).select(role.name).where(role.name == dt.role)
+			return frappe.qb.from_(dt).select(dt.name).where(ExistsCriterion(exists)).orderby(dt.name)
 
-		expected = query().run(as_dict=True)
+		expected = query().run()
 		self.assertTrue(expected)
 
 		with snapshot([self.doctype]) as targets:
-			# Role is not synced, so the join falls back to the site database
-			self.assertIsNone(get_query_target(query()))
+			stats, rows = self.answered_by(targets[0], lambda: query().run())
+			self.assertIn("tabRole", targets[0].tables)
 
-			targets[0].attach_live("Role", filters={"name": ("in", self.roles)})
+		self.assertEqual(expected, rows)
+		self.assertEqual(stats["duckdb"], 1, "the retry should have been answered by the snapshot")
+		self.assertEqual(stats["failed_bind"], 1, "the first bind should have reported the missing table")
 
-			self.assertIsNotNone(get_query_target(query()), "the join should now be served here")
-			self.assertEqual(expected, query().run(as_dict=True))
+	def test_synced_doctype_is_not_shadowed_by_a_live_copy(self):
+		"""A registered table shadows an attached one, which would swap frozen rows for live."""
+		with snapshot([self.doctype]) as targets:
+			target = targets[0]
+			table = frappe.utils.get_table_name(self.doctype)
+			self.assertIn(table, target.snapshot_tables)
+
+			target.attach_live(self.doctype)
+
+			self.assertNotIn(self.doctype, target.attempted)
+			dt = self.table()
+			self.assertEqual(len(frappe.qb.from_(dt).select(dt.name).run()), 6)
 
 	def test_live_table_types_survive_an_empty_scope(self):
 		"""An explicit schema keeps a join bindable when the live scope matches no rows."""
