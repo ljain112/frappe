@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from datetime import time, timedelta
+from datetime import datetime, time, timedelta
 
 import frappe
 from frappe.database import duckdb_file_path, get_duckdb
@@ -244,6 +244,20 @@ def apply_duckdb_limits(conn, writing: bool = False):
 		conn.execute("SET preserve_insertion_order = false")
 
 
+def attach_live(doctype: str, filters=None, fields: list[str] | None = None):
+	"""Make live rows of `doctype` queryable alongside any open snapshot, else do nothing.
+
+	A snapshot holds only the synced doctypes, so a report joining its fact table to master data
+	falls back to the site database and gets no acceleration -- which is most reports. Calling
+	this before such a query keeps the join in DuckDB, with the dimension read live so it is not
+	stale. It is a no-op when no snapshot is open, so callers need no branch of their own.
+
+	`filters` bound what is materialised; an unbounded master table would land in memory in full.
+	"""
+	for target in getattr(frappe.local, "query_targets", None) or ():
+		target.attach_live(doctype, filters=filters, fields=fields)
+
+
 def doctypes_to_sync() -> list[str]:
 	"""Doctypes replicated to DuckDB, declared once in System Settings.
 
@@ -292,6 +306,44 @@ class DuckDBSnapshotTarget:
 		import duckdb
 
 		return (duckdb.CatalogException, duckdb.BinderException)
+
+	def attach_live(self, doctype: str, filters=None, fields: list[str] | None = None):
+		"""Expose live rows of `doctype` to the snapshot connection as an Arrow table.
+
+		A snapshot holds only the synced doctypes, so a query joining one to master data falls
+		back to the site database and loses the acceleration entirely. Registering the rows that
+		query needs keeps the join inside DuckDB while the master data stays current -- the
+		snapshot supplies the frozen facts, this supplies the live dimensions.
+
+		`filters` bound what is materialised: the caller knows the scope its query will read, and
+		an unbounded master table would land in memory in full. Registering is idempotent, so a
+		second call with a wider scope replaces the first.
+		"""
+		import pyarrow as pa
+
+		# the arrow schema describes the table as the sync would create it, which can name columns
+		# an unsynced doctype does not actually have; get_valid_columns is what really exists
+		schema = DuckDBTable(doctype).get_arrow_schema()
+		fields = fields or frappe.get_meta(doctype).get_valid_columns()
+		schema = pa.schema([schema.field(name) for name in fields if name in schema.names])
+
+		rows = frappe.get_all(doctype, filters=filters, fields=list(schema.names), limit_page_length=0)
+
+		# mariadb hands a Time field back as a timedelta, which has no Arrow type; the sync
+		# converts the same way on its way in
+		times = [
+			name for name, dtype in zip(schema.names, schema.types, strict=False) if pa.types.is_time(dtype)
+		]
+		for row in rows:
+			for name in times:
+				if isinstance(value := row.get(name), timedelta):
+					row[name] = (datetime.min + value).time()
+
+		table = f"tab{doctype}"
+		# an explicit schema keeps the column types when there are no matching rows, so a join
+		# against an empty dimension still resolves instead of failing to bind
+		self.conn.register(table, pa.Table.from_pylist(rows, schema=schema))
+		self.tables.add(table)
 
 	def can_serve(self, tables: set[str]) -> bool:
 		"""The snapshots hold the synced doctypes, so anything else falls back."""

@@ -87,6 +87,13 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 	def table(self):
 		return frappe.qb.DocType(self.doctype)
 
+	def discard_sync(self, sync):
+		"""Drop a sync and its file, so it is not left as the newest snapshot for later tests."""
+		if sync.docstatus == 1:
+			sync.cancel()
+		frappe.delete_doc("DuckDB Sync", sync.name, force=True)
+		delete_duckdb_file(sync.filename)
+
 	def render(self, query):
 		"""Render `query` for the snapshot the way `execute_query` would."""
 		return prepare_query(query, dialect=db_type_is.DUCKDB)
@@ -190,7 +197,7 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 		"""
 		sync = frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": self.doctype}).insert()
 		sync.submit()
-		self.addCleanup(delete_duckdb_file, sync.filename)
+		self.addCleanup(self.discard_sync, sync)
 		self.assertGreater(len(sync.db_tables), 1, "the fixture should have a child table")
 
 		sync_data_to_duckdb(sync.name)
@@ -199,6 +206,34 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 			frappe.db.exists("DuckDB Sync Item", {"parent": sync.name, "synced": 0}),
 			"one invocation must load every table of the sync",
 		)
+
+	def test_scanner_path_is_skipped_off_mariadb(self):
+		"""DuckDB's scanner attaches over the MySQL wire protocol, so it is mariadb-only.
+
+		Nothing guarded this, so a postgres site with `sync_in_batch` off attached MySQL to a
+		postgres server and failed.
+		"""
+		from unittest.mock import patch
+
+		sync = frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": self.doctype}).insert()
+		sync.submit()
+		self.addCleanup(self.discard_sync, sync)
+
+		frappe.db.set_single_value("System Settings", "sync_in_batch", 0)
+		self.addCleanup(frappe.clear_cache)
+		self.addCleanup(frappe.db.set_single_value, "System Settings", "sync_in_batch", 1)
+		frappe.clear_cache()
+
+		module = "frappe.core.doctype.duckdb_sync.duckdb_sync"
+		with (
+			patch.dict(frappe.local.conf, {"db_type": "postgres"}),
+			patch(f"{module}.sync_using_extension") as scanner,
+			patch(f"{module}.sync_using_pyarrow") as pyarrow,
+		):
+			sync_data_to_duckdb(sync.name)
+
+		scanner.assert_not_called()
+		self.assertTrue(pyarrow.called, "a non-mariadb site must fall back to the pyarrow path")
 
 	def test_in_flight_sync_is_not_served_to_a_report(self):
 		"""A sync is submitted before its rows exist, and each table is emptied before refilling.
@@ -218,7 +253,7 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 		# submitted, so on_submit has created its (empty) tables, but the load never runs
 		in_flight = frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": self.doctype}).insert()
 		in_flight.submit()
-		self.addCleanup(delete_duckdb_file, in_flight.filename)
+		self.addCleanup(self.discard_sync, in_flight)
 		self.assertTrue(frappe.db.exists("DuckDB Sync Item", {"parent": in_flight.name, "synced": 0}))
 
 		with snapshot([self.doctype]):
@@ -243,7 +278,7 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 
 		sync = frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": "Role"}).insert()
 		sync.submit()
-		self.addCleanup(delete_duckdb_file, sync.filename)
+		self.addCleanup(self.discard_sync, sync)
 		for _ in range(20):
 			if not frappe.db.exists("DuckDB Sync Item", {"parent": sync.name, "synced": 0}):
 				break
@@ -279,6 +314,45 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 			settings.doctype_to_sync = [r for r in settings.doctype_to_sync if r.doc_type in before]
 			settings.flags.ignore_validate = True
 			settings.save(ignore_permissions=True)
+
+	def test_live_table_keeps_a_master_data_join_in_the_snapshot(self):
+		"""Attaching live rows lets a snapshot join master data without falling back.
+
+		Without it the whole query goes to the site database, so a report that joins its fact
+		table to a dimension -- which is most of them -- gets no acceleration at all.
+		"""
+		dt, role = self.table(), frappe.qb.DocType("Role")
+
+		def query():
+			return (
+				frappe.qb.from_(dt)
+				.join(role)
+				.on(role.name == dt.role)
+				.select(dt.name, role.name.as_("role_name"))
+				.orderby(dt.name)
+			)
+
+		expected = query().run(as_dict=True)
+		self.assertTrue(expected)
+
+		with snapshot([self.doctype]) as targets:
+			# Role is not synced, so the join falls back to the site database
+			self.assertIsNone(get_query_target(query()))
+
+			targets[0].attach_live("Role", filters={"name": ("in", self.roles)})
+
+			self.assertIsNotNone(get_query_target(query()), "the join should now be served here")
+			self.assertEqual(expected, query().run(as_dict=True))
+
+	def test_live_table_types_survive_an_empty_scope(self):
+		"""An explicit schema keeps a join bindable when the live scope matches no rows."""
+		dt, role = self.table(), frappe.qb.DocType("Role")
+
+		with snapshot([self.doctype]) as targets:
+			targets[0].attach_live("Role", filters={"name": "__no_such_role__"})
+			rows = frappe.qb.from_(dt).join(role).on(role.name == dt.role).select(dt.name).run()
+
+		self.assertEqual(rows, ())
 
 	def test_query_on_unsynced_doctype_falls_back(self):
 		with snapshot([self.doctype]):
