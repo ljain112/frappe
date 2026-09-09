@@ -1,7 +1,6 @@
 import inspect
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from enum import Enum
-from functools import partial
 from importlib import import_module
 from typing import Any, NamedTuple, get_type_hints
 

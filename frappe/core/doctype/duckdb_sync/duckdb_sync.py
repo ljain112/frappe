@@ -170,11 +170,22 @@ def sync_using_pyarrow(conn, dt, duck_tb):
 
 
 def sync_using_extension(conn, dt, duck_tb):
+	"""Load one table straight from the site database using DuckDB's MySQL scanner.
+
+	The scanner speaks the MySQL wire protocol, so callers must only take this path on mariadb;
+	`sync_data_to_duckdb` is what enforces that. The caller also owns the connection, because a
+	sync loads all of its tables over one of them.
+	"""
 	try:
 		conn.execute(f'delete from "{duck_tb.table_name}";').fetchall()
-		conn.sql(
-			f"attach 'user={frappe.conf.db_name} password={frappe.conf.db_password} host={frappe.conf.db_host} database={frappe.conf.db_name} port={frappe.conf.db_port}' as mariadb_db (TYPE mysql);"
-		)
+		if "mariadb_db" not in {row[0] for row in conn.sql("show databases").fetchall()}:
+			# a single quote in any value would otherwise end the string early
+			dsn = (
+				f"user={frappe.conf.db_name} password={frappe.conf.db_password} "
+				f"host={frappe.conf.db_host} database={frappe.conf.db_name} "
+				f"port={frappe.conf.db_port}"
+			).replace("'", "''")
+			conn.sql(f"attach '{dsn}' as mariadb_db (TYPE mysql);")
 		columns = frappe.get_meta(dt).get_valid_columns()
 		# quotted fields
 		columns_sql = ", ".join([f'"{x}"' for x in columns])
@@ -190,43 +201,42 @@ def sync_using_extension(conn, dt, duck_tb):
 		)
 
 		raise Exception(sanitized) from None
-	finally:
-		conn.close()
 
 
 def sync_data_to_duckdb(docname: str):
+	"""Load every table of `docname` in one job, so the snapshot is a single point in time.
+
+	A sync's tables are a doctype and its child tables, and reports join them. Loading them in
+	separate jobs -- separate transactions, and with `skip_locked` possibly at the same time --
+	captures a parent at a different moment than its children, so a report can see rows that
+	never coexisted. Reading them all before committing keeps them on one MariaDB snapshot, which
+	is the consistency DuckDB's guidance on full-refresh replication relies on.
+	"""
 	sync_dt = qb.DocType("DuckDB Sync Item")
-	if (
-		unsynced := qb.from_(sync_dt)
+	unsynced = (
+		qb.from_(sync_dt)
 		.select(sync_dt.name, sync_dt.table)
 		.where(sync_dt.parent.eq(docname) & sync_dt.synced.eq(False))
 		.orderby(sync_dt.idx)
-		.limit(1)
 		.for_update(skip_locked=True)
 		.run(as_dict=True)
-	):
-		dt = unsynced[0]["table"]
-		name = unsynced[0]["name"]
-		duck_tb = DuckDBTable(dt)
+	)
+	if not unsynced:
+		return
 
-		timeout = frappe.db.get_single_value("System Settings", "sync_timeout") or 25 * 60
-		sync_in_batch = frappe.db.get_single_value("System Settings", "sync_in_batch")
-		conn = frappe.get_doc("DuckDB Sync", docname).get_duckdb_conn()
-		if sync_in_batch:
-			sync_using_pyarrow(conn, dt, duck_tb)
-			conn.close()
-		else:
-			sync_using_extension(conn, dt, duck_tb)
+	# the scanner attaches over the MySQL wire protocol, so it is only usable on mariadb
+	use_scanner = not frappe.db.get_single_value("System Settings", "sync_in_batch")
+	use_scanner = use_scanner and frappe.conf.db_type == "mariadb"
 
-		# update flag
-		frappe.db.set_value("DuckDB Sync Item", name, "synced", True)
+	conn = frappe.get_doc("DuckDB Sync", docname).get_duckdb_conn()
+	try:
+		for item in unsynced:
+			duck_tb = DuckDBTable(item["table"])
+			if use_scanner:
+				sync_using_extension(conn, item["table"], duck_tb)
+			else:
+				sync_using_pyarrow(conn, item["table"], duck_tb)
 
-		# schedule next
-		frappe.enqueue(
-			method="frappe.core.doctype.duckdb_sync.duckdb_sync.sync_data_to_duckdb",
-			queue="long",
-			timeout=timeout,
-			is_async=True,
-			enqueue_after_commit=True,
-			docname=docname,
-		)
+			frappe.db.set_value("DuckDB Sync Item", item["name"], "synced", True)
+	finally:
+		conn.close()

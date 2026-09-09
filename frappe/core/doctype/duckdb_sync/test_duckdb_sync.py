@@ -29,6 +29,15 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 		super().setUpClass()
 
 		# our own doctype, so the assertions do not depend on whatever data a site happens to hold
+		cls.child_doctype = (
+			new_doctype(
+				istable=1,
+				fields=[{"label": "Note", "fieldname": "note", "fieldtype": "Data"}],
+			)
+			.insert()
+			.name
+		)
+
 		cls.doctype = (
 			new_doctype(
 				fields=[
@@ -36,6 +45,12 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 					{"label": "Role", "fieldname": "role", "fieldtype": "Link", "options": "Role"},
 					{"label": "Amount", "fieldname": "amount", "fieldtype": "Currency"},
 					{"label": "Start Time", "fieldname": "start_time", "fieldtype": "Time"},
+					{
+						"label": "Lines",
+						"fieldname": "lines",
+						"fieldtype": "Table",
+						"options": cls.child_doctype,
+					},
 				],
 			)
 			.insert()
@@ -52,6 +67,7 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 					"role": cls.roles[i % 2],
 					"amount": 10 * (i + 1),
 					"start_time": f"1{i}:30:00",
+					"lines": [{"note": f"line {i}"}],
 				}
 			).insert()
 
@@ -164,6 +180,25 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 		)
 		# and it is scoped to the one call -- the next read is back on the site database
 		self.assertIsNone(getattr(frappe.local, "query_targets", None))
+
+	def test_all_tables_of_a_sync_load_in_one_job(self):
+		"""A doctype and its child tables must be captured at the same point in time.
+
+		Loading them in separate jobs -- separate transactions, and with `skip_locked` possibly
+		at once -- lets a parent be captured at a different moment than its children, so a report
+		joining them sees rows that never coexisted.
+		"""
+		sync = frappe.get_doc({"doctype": "DuckDB Sync", "doc_type": self.doctype}).insert()
+		sync.submit()
+		self.addCleanup(delete_duckdb_file, sync.filename)
+		self.assertGreater(len(sync.db_tables), 1, "the fixture should have a child table")
+
+		sync_data_to_duckdb(sync.name)
+
+		self.assertFalse(
+			frappe.db.exists("DuckDB Sync Item", {"parent": sync.name, "synced": 0}),
+			"one invocation must load every table of the sync",
+		)
 
 	def test_in_flight_sync_is_not_served_to_a_report(self):
 		"""A sync is submitted before its rows exist, and each table is emptied before refilling.

@@ -2,7 +2,6 @@ from contextlib import contextmanager
 from datetime import time, timedelta
 
 import frappe
-from frappe import qb
 from frappe.database import duckdb_file_path, get_duckdb
 from frappe.database.database import Database
 from frappe.database.duckdb.schema import DuckDBTable
