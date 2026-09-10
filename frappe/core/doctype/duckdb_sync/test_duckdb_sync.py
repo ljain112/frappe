@@ -384,6 +384,28 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 
 		self.assertEqual(rows, ())
 
+	def test_dialect_specific_literal_falls_back_instead_of_failing(self):
+		"""Callers bake dialect decisions in at build time, and those reach the snapshot.
+
+		erpnext branches on `db_type` in 31 places; bank_clearance compares a date to mariadb's
+		'0000-00-00' zero date, which DuckDB rejects as a conversion error rather than a binder
+		one. The snapshot is an accelerator, so a query the site database can answer must not
+		become a failed report.
+		"""
+		dt = self.table()
+
+		def query():
+			return frappe.qb.from_(dt).select(dt.name).where(dt.start_time == "0000-00-00")
+
+		expected = query().run()
+
+		with snapshot([self.doctype]) as targets:
+			stats, rows = self.answered_by(targets[0], lambda: query().run())
+
+		self.assertEqual(expected, rows)
+		self.assertEqual(stats["duckdb"], 0, "DuckDB cannot answer this one")
+		self.assertEqual(stats["failed_bind"], 1, "and it must have fallen back, not raised")
+
 	def test_query_on_unsynced_doctype_falls_back(self):
 		with snapshot([self.doctype]):
 			role = frappe.qb.DocType("Role")

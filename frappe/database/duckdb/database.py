@@ -311,10 +311,18 @@ class DuckDBSnapshotTarget:
 
 	@property
 	def fallback_errors(self):
+		"""Any DuckDB failure sends the query back to the site database.
+
+		This is an accelerator, not the source of truth, so it must never turn a query the site
+		database can answer into a failed report. Callers bake dialect decisions in at build time
+		-- erpnext alone branches on `db_type` in 31 places, one of which emits mariadb's
+		'0000-00-00' zero date -- and those reach DuckDB as conversion, parser or binder errors
+		alike. Narrowing this to a few exception types just means the ones left out crash.
+		"""
 		# only evaluated when a query actually raises, so the import costs nothing otherwise
 		import duckdb
 
-		return (duckdb.CatalogException, duckdb.BinderException)
+		return (duckdb.Error,)
 
 	def attach_live(self, doctype: str, filters=None, fields: list[str] | None = None):
 		"""Expose live rows of `doctype` to the snapshot connection as an Arrow table.
