@@ -2,6 +2,7 @@ import unittest
 from collections.abc import Callable
 from datetime import time
 
+from pypika import Dialects
 from pypika.functions import Cast
 from pypika.terms import ValueWrapper
 
@@ -10,7 +11,7 @@ from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.database.operator_map import func_in
 from frappe.query_builder import Case
 from frappe.query_builder.builder import Function
-from frappe.query_builder.custom import ConstantColumn
+from frappe.query_builder.custom import ConstantColumn, MonthName, Year
 from frappe.query_builder.functions import (
 	Cast_,
 	Coalesce,
@@ -18,18 +19,28 @@ from frappe.query_builder.functions import (
 	CurDate,
 	Date,
 	DateDiff,
+	DateFormat,
 	GroupConcat,
 	JSONContains,
 	JSONExtract,
 	JSONValue,
+	Locate,
 	Match,
 	Month,
 	Quarter,
 	Round,
+	Timestamp,
 	Truncate,
 	UnixTimestamp,
+	YearWeek,
 )
-from frappe.query_builder.utils import db_type_is
+from frappe.query_builder.utils import (
+	DB_TYPES,
+	PseudoColumnMapper,
+	UnsupportedOperation,
+	db_type_is,
+	per_db_type,
+)
 from frappe.tests import IntegrationTestCase
 
 
@@ -900,3 +911,203 @@ class TestRecursiveCTE(IntegrationTestCase):
 		self.assertTrue(sql.startswith("WITH cte_a AS "))
 		self.assertNotIn("WITH RECURSIVE", sql)
 		self.assertIn(") ,cte_b AS (", sql)
+
+
+class TestPerDbType(IntegrationTestCase):
+	"""The render-time dispatch every backend-sensitive term is built on (`per_db_type`)."""
+
+	def test_dispatch_follows_the_rendering_dialect_not_the_site(self):
+		# one object, spelled per database at render time: the site's db_type is not consulted
+		term = GroupConcat("Notes")
+		self.assertEqual("GROUP_CONCAT('Notes' SEPARATOR ',')", term.get_sql(dialect=Dialects.MYSQL))
+		self.assertEqual("STRING_AGG('Notes',',')", term.get_sql(dialect=Dialects.POSTGRESQL))
+
+	@unimplemented_for(db_type_is.SQLITE)
+	def test_bare_render_defaults_to_the_site_database(self):
+		# a term rendered outside a query has no dialect in scope and falls back to frappe.qb's
+		expected = {"mariadb": "GROUP_CONCAT('Notes' SEPARATOR ',')", "postgres": "STRING_AGG('Notes',',')"}
+		self.assertEqual(expected[frappe.conf.db_type], GroupConcat("Notes").get_sql())
+
+	def test_undeclared_database_raises_instead_of_rendering_the_wrong_spelling(self):
+		with self.assertRaises(UnsupportedOperation) as raised:
+			GroupConcat("Notes").get_sql(dialect=Dialects.SQLLITE)
+		self.assertIn("GroupConcat.as_sqlite()", str(raised.exception))
+
+	def test_default_for(self):
+		# bare: the default is BASE_DB_TYPE's spelling, every other database must be declared
+		@per_db_type
+		class Base(Function):
+			def __init__(self):
+				super().__init__("F", 1)
+
+		# a set: the default is right on exactly these
+		@per_db_type(default_for={"mariadb", "sqlite"})
+		class Two(Function):
+			def __init__(self):
+				super().__init__("F", 1)
+
+			def as_postgres(self, **kwargs):
+				return "G(1)"
+
+		# "*": the default is right everywhere, methods are exceptions
+		@per_db_type(default_for="*")
+		class Universal(Function):
+			def __init__(self):
+				super().__init__("F", 1)
+
+		self.assertEqual("F(1)", Base().get_sql(dialect=Dialects.MYSQL))
+		self.assertRaises(UnsupportedOperation, Base().get_sql, dialect=Dialects.POSTGRESQL)
+		self.assertRaises(UnsupportedOperation, Base().get_sql, dialect=Dialects.SQLLITE)
+		self.assertEqual("F(1)", Two().get_sql(dialect=Dialects.MYSQL))
+		self.assertEqual("F(1)", Two().get_sql(dialect=Dialects.SQLLITE))
+		self.assertEqual("G(1)", Two().get_sql(dialect=Dialects.POSTGRESQL))
+		for dialect in (Dialects.MYSQL, Dialects.POSTGRESQL, Dialects.SQLLITE):
+			self.assertEqual("F(1)", Universal().get_sql(dialect=dialect))
+
+	def test_cast_is_universal_with_mariadb_as_the_exception(self):
+		self.assertEqual("CAST('5' AS VARCHAR)", Cast_("5", "varchar").get_sql(dialect=Dialects.SQLLITE))
+		self.assertEqual("CAST('5' AS VARCHAR)", Cast_("5", "varchar").get_sql(dialect=Dialects.POSTGRESQL))
+		self.assertEqual("CONCAT('5','')", Cast_("5", "varchar").get_sql(dialect=Dialects.MYSQL))
+		# only a varchar cast is special on mariadb
+		self.assertEqual("CAST('5' AS INTEGER)", Cast_("5", "integer").get_sql(dialect=Dialects.MYSQL))
+
+	def test_raw_args_keeps_the_operands_pypika_wraps(self):
+		# _PostgresTimestamp casts a `str` operand; after Function.__init__ it is a ValueWrapper and
+		# the isinstance check can never fire -- raw_args is what lets the CASTs survive
+		term = CombineDatetime("2021-01-01", "00:00:21")
+		self.assertEqual(("2021-01-01", "00:00:21"), term.raw_args)
+		self.assertEqual(
+			"CAST('2021-01-01' AS DATE)+CAST('00:00:21' AS TIME)", term.get_sql(dialect=Dialects.POSTGRESQL)
+		)
+
+	def test_undecorated_term_is_untouched(self):
+		term = Round("1.234", 2)
+		self.assertFalse(hasattr(term, "raw_args"))
+		for dialect in (Dialects.MYSQL, Dialects.POSTGRESQL, Dialects.SQLLITE):
+			self.assertEqual("ROUND('1.234',2)", term.get_sql(dialect=dialect))
+
+	def test_values_stay_parameterised_through_every_spelling(self):
+		from frappe.query_builder.terms import NamedParameterWrapper
+
+		hostile = "a' OR 1=1 --"
+		note = frappe.qb.DocType("Note")
+		query = frappe.qb.from_(note).select(
+			DateFormat(note.creation, hostile), Locate(hostile, note.title), CombineDatetime(hostile, hostile)
+		)
+		for dialect in (Dialects.MYSQL, Dialects.POSTGRESQL):
+			params = NamedParameterWrapper()
+			sql = query.get_sql(param_wrapper=params, dialect=dialect)
+			self.assertNotIn(hostile, sql)
+			self.assertEqual(4, len(params.parameters))
+
+
+class TestDbTypeMatrix(IntegrationTestCase):
+	"""Every backend-sensitive term, rendered for every database and executed where it can be.
+
+	Execution runs on the site's own database and on SQLite in-process; the remaining databases
+	are render-only here and execute when the suite runs on their site. Red cells are declared:
+	UNSUPPORTED names the terms that refuse a database, KNOWN_INVALID the ones that render but the
+	database rejects. Both are asserted in both directions, so fixing a hole or opening one fails
+	this test until the table says so.
+	"""
+
+	# rendered over literals so a cell executes without a table; the FIELD_ONLY ones need a column
+	# (a fulltext index, a JSON column, a real identifier) and are render-only everywhere
+	DATE = Cast("2021-01-05", "date")
+	FIELD_ONLY = frozenset(
+		{"Match", "JSONExtract", "JSONValue", "JSONContains", "Like", "NotLike", "Regex", "PseudoColumn"}
+	)
+	UNSUPPORTED = frozenset(
+		("sqlite", name)
+		for name in (
+			"GroupConcat",
+			"Match",
+			"CombineDatetime",
+			"DateFormat",
+			"UnixTimestamp",
+			"DateDiff",
+			"JSONExtract",
+			"JSONValue",
+			"JSONContains",
+			"MonthName",
+			"Quarter",
+			"Month",
+			"Year",
+		)
+	)
+	# undecorated terms whose default is not, in fact, universal -- the debt the matrix records
+	KNOWN_INVALID = frozenset(
+		(db, name) for db in ("postgres", "sqlite") for name in ("Truncate", "Timestamp", "YearWeek")
+	)
+
+	@classmethod
+	def cases(cls):
+		doctype = frappe.qb.DocType("DocType")
+		column = frappe.qb.DocType("x").c
+		return {
+			"Locate": Locate("b", "abc"),
+			"GroupConcat": GroupConcat("Notes").distinct().separator(" | "),
+			"Match": Match(doctype.name).Against("x"),
+			"CombineDatetime": CombineDatetime("2021-01-05", "00:00:21"),
+			"DateFormat": DateFormat(cls.DATE, "%Y-%m"),
+			"UnixTimestamp": UnixTimestamp(cls.DATE),
+			"DateDiff": DateDiff(cls.DATE, cls.DATE),
+			"JSONExtract": JSONExtract(doctype.name, "$.a"),
+			"JSONValue": JSONValue(doctype.name, "$.a"),
+			"JSONContains": JSONContains(doctype.name, "x"),
+			"MonthName": MonthName(cls.DATE),
+			"Quarter": Quarter(cls.DATE),
+			"Month": Month(cls.DATE),
+			"Year": Year(cls.DATE),
+			"Cast_": Cast_("5", "varchar"),
+			"Like": column.like("a%"),
+			"NotLike": column.not_like("a%"),
+			"Regex": column.regex("^a"),
+			"PseudoColumn": PseudoColumnMapper("`tabDocType`.`name`"),
+			"Round": Round("1.234", 2),
+			"Truncate": Truncate("1.234", 2),
+			"Timestamp": Timestamp("2021-01-05"),
+			"YearWeek": YearWeek(cls.DATE),
+		}
+
+	def render(self, term, db_type):
+		spec = DB_TYPES[db_type_is(db_type)]
+		return term.get_sql(dialect=spec.pypika, quote_char=spec.builder._BuilderClasss.QUOTE_CHAR)
+
+	def test_every_cell_renders_or_is_declared_unsupported(self):
+		for db_type in DB_TYPES:
+			for name, term in self.cases().items():
+				with self.subTest(db_type=db_type.value, term=name):
+					if (db_type.value, name) in self.UNSUPPORTED:
+						self.assertRaises(UnsupportedOperation, self.render, term, db_type.value)
+					else:
+						self.assertTrue(self.render(term, db_type.value))
+
+	def test_every_renderable_cell_executes_on_the_site_database(self):
+		db_type = frappe.conf.db_type
+		for name, term in self.cases().items():
+			if name in self.FIELD_ONLY or (db_type, name) in self.UNSUPPORTED:
+				continue
+			with self.subTest(term=name):
+				sql = f"select {self.render(term, db_type)}"
+				if (db_type, name) in self.KNOWN_INVALID:
+					with self.assertRaises(Exception):
+						frappe.db.sql(sql)
+					frappe.db.rollback()
+				else:
+					frappe.db.sql(sql)
+
+	def test_every_renderable_cell_executes_on_sqlite(self):
+		# SQLite runs in-process, so its column of the matrix is proven on every site
+		import sqlite3
+
+		connection = sqlite3.connect(":memory:")
+		for name, term in self.cases().items():
+			if name in self.FIELD_ONLY or ("sqlite", name) in self.UNSUPPORTED:
+				continue
+			with self.subTest(term=name):
+				sql = f"select {self.render(term, 'sqlite')}"
+				if ("sqlite", name) in self.KNOWN_INVALID:
+					self.assertRaises(sqlite3.OperationalError, connection.execute, sql)
+				else:
+					connection.execute(sql).fetchone()
