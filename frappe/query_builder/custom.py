@@ -5,6 +5,7 @@ from pypika.terms import Term
 from pypika.utils import builder, format_alias_sql, format_quotes
 
 import frappe
+from frappe.query_builder.utils import per_db_type
 
 
 class GROUP_CONCAT(DistinctOptionFunction):
@@ -147,57 +148,48 @@ class ConstantColumn(Term):
 
 # MONTHNAME/MONTH/QUARTER are MySQL-only. On postgres use to_char / date_part: to_char(.., 'FMMonth')
 # gives the full month name, and date_part gives the numeric month/quarter. date_part returns double
-# precision, so MONTH/QUARTER cast it back to INTEGER to match MySQL's integer result exactly (see
-# _PostgresIntDatePart) -- otherwise a `2.0` leaks into report JSON/UI where MariaDB shows `2`.
-def _is_postgres() -> bool:
-	return bool(frappe.db) and frappe.db.db_type == "postgres"
+# precision, so MONTH/QUARTER/YEAR cast it back to INTEGER to match MySQL's integer result exactly --
+# otherwise a `2.0` leaks into report JSON/UI where MariaDB shows `2`.
+def _postgres_int_date_part(part: str, field, alias, **kwargs) -> str:
+	"""`CAST(date_part('<part>', field) AS INTEGER)`, rendered for postgres."""
+	with_alias = kwargs.pop("with_alias", False)
+	sql = f"CAST({Function('date_part', part, field).get_sql(**kwargs)} AS INTEGER)"
+	if with_alias:
+		return format_alias_sql(sql, alias, **kwargs)
+	return sql
 
 
-class _PostgresIntDatePart:
-	"""Mixin for the postgres date_part(...) functions below: wrap the result in
-	CAST(... AS INTEGER) so it matches MySQL's integer MONTH()/QUARTER(). Mirrors the
-	UnixTimestamp BIGINT cast. No-op on MariaDB (those branches use the native int function)."""
-
-	def get_sql(self, **kwargs):
-		if not self._postgres:
-			return super().get_sql(**kwargs)
-		with_alias = kwargs.pop("with_alias", False)
-		sql = f"CAST({super().get_sql(**kwargs)} AS INTEGER)"
-		if with_alias:
-			return format_alias_sql(sql, self.alias, **kwargs)
-		return sql
-
-
+@per_db_type
 class MonthName(Function):
 	def __init__(self, field, alias=None):
-		if _is_postgres():
-			super().__init__("to_char", field, "FMMonth", alias=alias)
-		else:
-			super().__init__("MONTHNAME", field, alias=alias)
+		super().__init__("MONTHNAME", field, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return Function("to_char", self.args[0], "FMMonth", alias=self.alias).get_sql(**kwargs)
 
 
-class Quarter(_PostgresIntDatePart, Function):
+@per_db_type
+class Quarter(Function):
 	def __init__(self, field, alias=None):
-		self._postgres = _is_postgres()
-		if self._postgres:
-			super().__init__("date_part", "quarter", field, alias=alias)
-		else:
-			super().__init__("QUARTER", field, alias=alias)
+		super().__init__("QUARTER", field, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _postgres_int_date_part("quarter", self.args[0], self.alias, **kwargs)
 
 
-class Month(_PostgresIntDatePart, Function):
+@per_db_type
+class Month(Function):
 	def __init__(self, field, alias=None):
-		self._postgres = _is_postgres()
-		if self._postgres:
-			super().__init__("date_part", "month", field, alias=alias)
-		else:
-			super().__init__("MONTH", field, alias=alias)
+		super().__init__("MONTH", field, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _postgres_int_date_part("month", self.args[0], self.alias, **kwargs)
 
 
-class Year(_PostgresIntDatePart, Function):
+@per_db_type
+class Year(Function):
 	def __init__(self, field, alias=None):
-		self._postgres = _is_postgres()
-		if self._postgres:
-			super().__init__("date_part", "year", field, alias=alias)
-		else:
-			super().__init__("YEAR", field, alias=alias)
+		super().__init__("YEAR", field, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _postgres_int_date_part("year", self.args[0], self.alias, **kwargs)

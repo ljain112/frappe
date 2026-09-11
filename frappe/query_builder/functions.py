@@ -2,7 +2,7 @@ from datetime import time
 from enum import Enum
 
 from pypika.functions import *
-from pypika.terms import Arithmetic, ArithmeticExpression, CustomFunction, Function, Term
+from pypika.terms import Arithmetic, ArithmeticExpression, Function, Term
 from pypika.utils import format_alias_sql
 
 import frappe
@@ -16,7 +16,7 @@ from frappe.query_builder.custom import (
 	Quarter,
 	Year,
 )
-from frappe.query_builder.utils import ImportMapper, db_type_is
+from frappe.query_builder.utils import per_db_type
 
 from .utils import PseudoColumn
 
@@ -41,7 +41,15 @@ class Instr(Function):
 		super().__init__("INSTR", haystack, needle, **kwargs)
 
 
-Locate = ImportMapper({db_type_is.MARIADB: Locate, db_type_is.POSTGRES: Strpos, db_type_is.SQLITE: Instr})
+@per_db_type
+class Locate(Locate):
+	"""LOCATE(needle, haystack), in each backend's own spelling."""
+
+	def as_postgres(self, **kwargs):
+		return Strpos(*self.args, alias=self.alias).get_sql(**kwargs)
+
+	def as_sqlite(self, **kwargs):
+		return Instr(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
 # for backward compatibility
@@ -93,9 +101,28 @@ class CurDate(Term):
 		return "CURRENT_DATE"
 
 
-GroupConcat = ImportMapper({db_type_is.MARIADB: GROUP_CONCAT, db_type_is.POSTGRES: STRING_AGG})
+@per_db_type
+class GroupConcat(GROUP_CONCAT):
+	"""GROUP_CONCAT, rendered as STRING_AGG where that is the spelling.
 
-Match = ImportMapper({db_type_is.MARIADB: MATCH, db_type_is.POSTGRES: TO_TSVECTOR})
+	MySQL puts the delimiter in a SEPARATOR clause and postgres takes it as a second argument,
+	so the separator travels on the term and each rendering places it itself.
+	"""
+
+	def as_postgres(self, **kwargs):
+		term = STRING_AGG(self.args[0], self._separator, alias=self.alias)
+		# `.distinct()` is a @builder method, so its state lives on the term this replaces and has
+		# to travel with it -- dropping it silently widens the result instead of failing
+		term._distinct = self._distinct
+		return term.get_sql(**kwargs)
+
+
+@per_db_type
+class Match(MATCH):
+	"""Full-text search: MATCH ... AGAINST on mariadb, to_tsvector on postgres."""
+
+	def as_postgres(self, **kwargs):
+		return TO_TSVECTOR(self.args[0], alias=self.alias).Against(self._Against).get_sql(**kwargs)
 
 
 class _PostgresTimestamp(ArithmeticExpression):
@@ -111,19 +138,27 @@ class _PostgresTimestamp(ArithmeticExpression):
 		super().__init__(operator=Arithmetic.add, left=datepart, right=timepart, alias=alias)
 
 
-CombineDatetime = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("TIMESTAMP", ["date", "time"]),
-		db_type_is.POSTGRES: _PostgresTimestamp,
-	}
-)
+@per_db_type
+class CombineDatetime(Function):
+	"""TIMESTAMP(date, time); postgres adds the two parts instead."""
 
-DateFormat = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("DATE_FORMAT", ["date", "format"]),
-		db_type_is.POSTGRES: ToChar,
-	}
-)
+	def __init__(self, date, time, alias=None):
+		super().__init__("TIMESTAMP", date, time, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		# raw_args: _PostgresTimestamp casts a `str` / `time` operand, which it cannot see once wrapped
+		return _PostgresTimestamp(*self.raw_args, alias=self.alias).get_sql(**kwargs)
+
+
+@per_db_type
+class DateFormat(Function):
+	"""DATE_FORMAT(date, format), in each backend's own spelling."""
+
+	def __init__(self, date, format, alias=None):
+		super().__init__("DATE_FORMAT", date, format, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return ToChar(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
 class YearWeek(Function):
@@ -151,12 +186,15 @@ class _PostgresUnixTimestamp(Extract):
 		return sql
 
 
-UnixTimestamp = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("unix_timestamp", ["date"]),
-		db_type_is.POSTGRES: _PostgresUnixTimestamp,
-	}
-)
+@per_db_type
+class UnixTimestamp(Function):
+	"""unix_timestamp(date); elsewhere an epoch extraction."""
+
+	def __init__(self, date, alias=None):
+		super().__init__("unix_timestamp", date, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _PostgresUnixTimestamp(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
 class _PostgresDateDiff(ArithmeticExpression):
@@ -174,12 +212,15 @@ class _PostgresDateDiff(ArithmeticExpression):
 		)
 
 
-DateDiff = ImportMapper(
-	{
-		db_type_is.MARIADB: CustomFunction("DATEDIFF", ["date1", "date2"]),
-		db_type_is.POSTGRES: _PostgresDateDiff,
-	}
-)
+@per_db_type
+class DateDiff(Function):
+	"""DATEDIFF(date1, date2); postgres subtracts the two dates instead."""
+
+	def __init__(self, date1, date2, alias=None):
+		super().__init__("DATEDIFF", date1, date2, alias=alias)
+
+	def as_postgres(self, **kwargs):
+		return _PostgresDateDiff(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
 class _MariaDBJSONExtract(Function):
@@ -201,53 +242,62 @@ class _MariaDBJSONContains(Function):
 		super().__init__("JSON_CONTAINS", target, candidate, **kwargs)
 
 
-JSONExtract = ImportMapper(
-	{
-		db_type_is.MARIADB: _MariaDBJSONExtract,
-		db_type_is.POSTGRES: lambda field, path, **kw: field.get_json_value(path),
-	}
-)
+@per_db_type
+class JSONExtract(_MariaDBJSONExtract):
+	"""JSON_EXTRACT(field, path); postgres has the `->` operator.
 
-JSONValue = ImportMapper(
-	{
-		db_type_is.MARIADB: _MariaDBJSONValue,
-		db_type_is.POSTGRES: lambda field, path, **kw: field.get_text_value(path),
-	}
-)
+	The postgres renderings of the three JSON terms are pypika operators built from the `Field`
+	itself, so they read `raw_args` rather than the wrapped `args`.
+	"""
 
-JSONContains = ImportMapper(
-	{
-		db_type_is.MARIADB: _MariaDBJSONContains,
-		db_type_is.POSTGRES: lambda target, candidate, **kw: target.contains(candidate),
-	}
-)
+	def as_postgres(self, **kwargs):
+		field, path = self.raw_args
+		return field.get_json_value(path).get_sql(**kwargs)
 
 
+@per_db_type
+class JSONValue(_MariaDBJSONValue):
+	"""JSON_UNQUOTE(JSON_EXTRACT(field, path)); postgres has the `->>` operator."""
+
+	def as_postgres(self, **kwargs):
+		field, path = self.raw_args
+		return field.get_text_value(path).get_sql(**kwargs)
+
+
+@per_db_type
+class JSONContains(_MariaDBJSONContains):
+	"""JSON_CONTAINS(target, candidate); postgres has the `@>` operator."""
+
+	def as_postgres(self, **kwargs):
+		target, candidate = self.raw_args
+		return target.contains(candidate).get_sql(**kwargs)
+
+
+@per_db_type(default_for="*")
 class Cast_(Function):
-	def __init__(self, value, as_type, alias=None):
-		if frappe.db.db_type == "mariadb" and (
-			(hasattr(as_type, "get_sql") and as_type.get_sql().lower() == "varchar")
-			or str(as_type).lower() == "varchar"
-		):
-			# mimics varchar cast in mariadb
-			# as mariadb doesn't have varchar data cast
-			# https://mariadb.com/kb/en/cast/#description
+	"""CAST(value AS type).
 
-			# ref: https://stackoverflow.com/a/32542095
-			super().__init__("CONCAT", value, "", alias=alias)
-		else:
-			# from source: https://pypika.readthedocs.io/en/latest/_modules/pypika/functions.html#Cast
-			super().__init__("CAST", value, alias=alias)
-			self.as_type = as_type
+	MariaDB has no VARCHAR cast (https://mariadb.com/kb/en/cast/#description), so a varchar cast
+	is spelled `CONCAT(value, '')` there -- ref https://stackoverflow.com/a/32542095. Every other
+	database, and every other type, takes the plain CAST.
+	"""
+
+	def __init__(self, value, as_type, alias=None):
+		# from source: https://pypika.readthedocs.io/en/latest/_modules/pypika/functions.html#Cast
+		super().__init__("CAST", value, alias=alias)
+		self.as_type = as_type
 
 	def get_special_params_sql(self, **kwargs):
-		if self.name.lower() == "cast":
-			type_sql = (
-				self.as_type.get_sql(**kwargs)
-				if hasattr(self.as_type, "get_sql")
-				else str(self.as_type).upper()
-			)
-			return f"AS {type_sql}"
+		type_sql = (
+			self.as_type.get_sql(**kwargs) if hasattr(self.as_type, "get_sql") else str(self.as_type).upper()
+		)
+		return f"AS {type_sql}"
+
+	def as_mariadb(self, **kwargs):
+		type_name = self.as_type.get_sql() if hasattr(self.as_type, "get_sql") else str(self.as_type)
+		if type_name.lower() != "varchar":
+			return super().get_sql(**kwargs)
+		return Function("CONCAT", self.raw_args[0], "", alias=self.alias).get_sql(**kwargs)
 
 
 def _aggregate(function, dt, fieldname, filters, **kwargs):

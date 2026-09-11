@@ -1,30 +1,19 @@
+import functools
 import inspect
-from collections.abc import Callable
+import types
 from enum import Enum
 from importlib import import_module
-from typing import Any, get_type_hints
+from typing import Any, NamedTuple, get_type_hints
 
+from pypika import Dialects
+from pypika.enums import Comparator, Matching
 from pypika.queries import Column, QueryBuilder, _SetOperation
-from pypika.terms import PseudoColumn
+from pypika.terms import BasicCriterion, PseudoColumn
 
 import frappe
 from frappe.query_builder.terms import NamedParameterWrapper
 
 from .builder import Base, MariaDB, Postgres, SQLite
-
-
-class PseudoColumnMapper(PseudoColumn):
-	def __init__(self, name: str) -> None:
-		super().__init__(name)
-
-	def get_sql(self, **kwargs):
-		if frappe.db.db_type == "postgres":
-			# Returned, not assigned to `self.name`: rendering must not mutate the term, or a
-			# pseudo-column rendered once on postgres renders wrongly everywhere after.
-			from frappe.database.utils import convert_backtick_identifiers
-
-			return convert_backtick_identifiers(self.name)
-		return self.name
 
 
 class db_type_is(Enum):
@@ -33,22 +22,123 @@ class db_type_is(Enum):
 	SQLITE = "sqlite"
 
 
-DB_TYPE_MAP = {
-	db_type_is.MARIADB: MariaDB,
-	db_type_is.POSTGRES: Postgres,
-	db_type_is.SQLITE: SQLite,
+class DbType(NamedTuple):
+	"""One database backend, as the query builder sees it."""
+
+	#: the `db_type` name; `per_db_type` dispatches to `as_<name>()`
+	name: str
+	builder: type
+	#: what pypika threads down the render tree as `dialect`. Its own members are kept rather
+	#: than replaced because pypika reads them itself (`Array` renders ARRAY[...] on postgres;
+	#: `Interval` and `Now` have sqlite spellings).
+	pypika: Dialects
+
+
+DB_TYPES = {
+	db_type_is.MARIADB: DbType("mariadb", MariaDB, Dialects.MYSQL),
+	db_type_is.POSTGRES: DbType("postgres", Postgres, Dialects.POSTGRESQL),
+	db_type_is.SQLITE: DbType("sqlite", SQLite, Dialects.SQLLITE),
 }
 
-assert set(DB_TYPE_MAP) == set(db_type_is), "DB_TYPE_MAP must map every db_type_is member to a builder"
+assert set(DB_TYPES) == set(db_type_is), "DB_TYPES must describe every db_type_is member"
+
+# derived views; add a database as one row in DB_TYPES, never here
+DB_TYPE_MAP = {key: backend.builder for key, backend in DB_TYPES.items()}
+_DB_TYPE_NAMES = {backend.pypika: backend.name for backend in DB_TYPES.values()}
 
 
-class ImportMapper:
-	def __init__(self, func_map: dict[db_type_is, Callable]) -> None:
-		self.func_map = func_map
+# the site's builder is the default for a term rendered outside a query -- a bare `term.get_sql()`
+# in a test or a helper. Inside a query pypika supplies `dialect` at the root, so this is never
+# consulted on a real query path. Keyed by builder so the fallback is exactly what `frappe.qb`
+# would have used, with no config parsing per render.
+_PYPIKA_BY_BUILDER = {backend.builder: backend.pypika for backend in DB_TYPES.values()}
+_RENDERER_ATTRS = {name: f"as_{name}" for name in _DB_TYPE_NAMES.values()}
 
-	def __call__(self, *args: Any, **kwds: Any) -> Callable:
-		db = db_type_is(frappe.conf.db_type)
-		return self.func_map[db](*args, **kwds)
+
+#: the spelling frappe's query builder is written in: every undecorated term, and the default
+#: rendering of every `per_db_type` term unless it says otherwise
+BASE_DB_TYPE = db_type_is.MARIADB.value
+
+
+class UnsupportedOperation(NotImplementedError):
+	"""A term has no rendering for the database it is being rendered for."""
+
+	def __init__(self, term: type, db_type: str) -> None:
+		super().__init__(
+			f"{term.__name__} cannot be rendered for {db_type}: "
+			f"define {term.__name__}.as_{db_type}() or list {db_type!r} in default_for"
+		)
+
+
+def per_db_type(cls=None, *, default_for: str | set[str] = BASE_DB_TYPE):
+	"""Let a term render differently per database, following Django's `as_<vendor>()` convention.
+
+	A term that renders the same everywhere needs nothing. A term whose spelling differs is
+	decorated and defines `as_postgres()` / `as_sqlite()` / ... for each database that differs
+	from its default rendering. Rendering picks `as_<db_type>()` when the class defines it, the
+	default when the database is one `default_for` names, and raises `UnsupportedOperation`
+	otherwise -- a database the term does not know is an error, not a silent wrong spelling.
+
+	`default_for` says which databases the default rendering is written for. Left alone it is
+	`BASE_DB_TYPE`, which is true of every term in frappe today; pass a set when the default is
+	right on several (`default_for={"mariadb", "sqlite"}`) or `"*"` when it is right everywhere
+	and the methods are exceptions.
+
+	The database comes from the `dialect` pypika threads through the whole render tree, rather
+	than from `frappe.conf.db_type` at construction: the same term object renders correctly
+	wherever it is sent, and another database is an added method rather than an edit to a
+	dispatch table.
+
+	The decorator also keeps `self.raw_args` -- the operands as the caller passed them. pypika's
+	`Function.__init__` wraps every operand in a `ValueWrapper` before an `as_*` method can look
+	at it, so a rendering that must inspect an operand (cast a `str` to DATE, call a `Field`
+	method) reads `raw_args`, not `self.args`.
+
+	    @per_db_type
+	    class GroupConcat(GROUP_CONCAT):
+	        def as_postgres(self, **kwargs): ...
+	"""
+	defaults = (
+		None if default_for == "*" else {default_for} if isinstance(default_for, str) else set(default_for)
+	)
+
+	def decorate(cls):
+		init, default = cls.__init__, cls.get_sql
+
+		@functools.wraps(init)
+		def __init__(self, *args, **kwargs):
+			self.raw_args = args
+			init(self, *args, **kwargs)
+
+		@functools.wraps(default)
+		def get_sql(self, **kwargs: Any) -> str:
+			dialect = kwargs.get("dialect") or _PYPIKA_BY_BUILDER.get(getattr(frappe.local, "qb", None))
+			name = _DB_TYPE_NAMES.get(dialect)
+			if name is None:
+				return default(self, **kwargs)
+			if renderer := getattr(self, _RENDERER_ATTRS[name], None):
+				return renderer(**kwargs)
+			if defaults is None or name in defaults:
+				return default(self, **kwargs)
+			raise UnsupportedOperation(cls, name)
+
+		cls.__init__, cls.get_sql = __init__, get_sql
+		return cls
+
+	return decorate(cls) if cls is not None else decorate
+
+
+@per_db_type(default_for={"mariadb", "sqlite"})
+class PseudoColumnMapper(PseudoColumn):
+	def __init__(self, name: str) -> None:
+		super().__init__(name)
+
+	def as_postgres(self, **kwargs):
+		# Returned, not assigned to `self.name`: rendering must not mutate the term, or a
+		# pseudo-column rendered once on postgres renders wrongly everywhere after.
+		from frappe.database.utils import convert_backtick_identifiers
+
+		return convert_backtick_identifiers(self.name)
 
 
 class BuilderIdentificationFailed(Exception):
@@ -290,58 +380,64 @@ def patch_get_query():
 	Base.get_query = get_query
 
 
-def patch_like_operators():
-	"""Render the query-builder LIKE / NOT LIKE operators as ILIKE / NOT ILIKE on postgres.
+class PostgresMatching(Comparator):
+	regex = " ~* "
 
-	MariaDB's default collation makes LIKE case-insensitive; postgres compares text
-	case-sensitively, so a `.like()` search (link-field autocomplete, etc.) would only match
-	exact case on postgres. Mapping to ILIKE keeps pattern matching case-insensitive on both
-	backends -- matching MariaDB and the like->ilike translation `frappe.db.get_list` already
-	applies for its filter path. MariaDB keeps native LIKE.
+
+@per_db_type(default_for="*")
+class LikeCriterion(BasicCriterion):
+	"""LIKE / NOT LIKE, rendered ILIKE / NOT ILIKE on postgres.
+
+	MariaDB's default collation makes LIKE case-insensitive (and so does SQLite's, for ASCII);
+	postgres compares text case-sensitively, so a `.like()` search (link-field autocomplete,
+	etc.) would only match exact case there. Mapping to ILIKE keeps pattern matching
+	case-insensitive on every backend -- matching the like->ilike translation
+	`frappe.db.get_list` already applies for its filter path.
 	"""
-	# pypika has no hook for dialect-specific operator rendering, so patch Term.like/not_like the same
-	# way the query-builder patches above (QueryBuilder.run, Base.max, ...) and app.py's
-	# Request.max_form_memory_size do. The rule anchors on the import, so suppress it there too.
+
+	_POSTGRES = types.MappingProxyType({Matching.like: Matching.ilike, Matching.not_like: Matching.not_ilike})
+
+	def as_postgres(self, **kwargs):
+		comparator = self._POSTGRES.get(self.comparator, self.comparator)
+		return BasicCriterion(comparator, self.left, self.right, alias=self.alias).get_sql(**kwargs)
+
+
+@per_db_type(default_for={"mariadb", "sqlite"})
+class RegexCriterion(BasicCriterion):
+	"""The regex operator in each backend's native spelling.
+
+	pypika's Term.regex emits " REGEX ", which is an operator on neither backend: MySQL and SQLite
+	spell it REGEXP, postgres uses the case-insensitive match ~*. Emitting the right operator here
+	also means a generated query no longer depends on the textual REGEXP rewrite in modify_query.
+	"""
+
+	def as_postgres(self, **kwargs):
+		return BasicCriterion(PostgresMatching.regex, self.left, self.right, alias=self.alias).get_sql(
+			**kwargs
+		)
+
+
+def patch_term_operators():
+	"""Make Term.like / not_like / regex build the criteria above.
+
+	pypika has no hook for backend-specific operator rendering, so patch Term the same way the
+	query-builder patches above (QueryBuilder.run, Base.max, ...) and app.py's
+	Request.max_form_memory_size do. The rule anchors on the import, so suppress it there too.
+	The criteria themselves decide the spelling at render time, so nothing here reads db_type.
+	"""
 	from pypika.terms import Term  # nosemgrep: frappe-monkey-patching-not-allowed
 
-	_like, _not_like = Term.like, Term.not_like
-
 	def like(self, expr: str):
-		if frappe.db and frappe.db.db_type == "postgres":
-			return self.ilike(expr)
-		return _like(self, expr)
+		return LikeCriterion(Matching.like, self, self.wrap_constant(expr))
 
 	def not_like(self, expr: str):
-		if frappe.db and frappe.db.db_type == "postgres":
-			return self.not_ilike(expr)
-		return _not_like(self, expr)
+		return LikeCriterion(Matching.not_like, self, self.wrap_constant(expr))
+
+	def regex(self, pattern: str):
+		return RegexCriterion(Matching.regexp, self, self.wrap_constant(pattern))
 
 	Term.like = like  # nosemgrep: frappe-monkey-patching-not-allowed
 	Term.not_like = not_like  # nosemgrep: frappe-monkey-patching-not-allowed
-
-
-def patch_regex_operator():
-	"""Render the query-builder regex operator in each backend's native spelling.
-
-	pypika's Term.regex emits " REGEX ", which is an operator on neither backend: MySQL spells it
-	REGEXP, postgres uses the case-insensitive match ~*. So `frappe.get_all(filters={"f":
-	["regex", ...]})` produced a syntax error everywhere. Emitting the right operator here also
-	means a generated query no longer depends on the textual REGEXP rewrite in modify_query.
-	"""
-	# pypika has no hook for dialect-specific operator rendering, so patch Term.regex the same way
-	# patch_like_operators above does. The rule anchors on the import, so suppress it there too.
-	from pypika.enums import Comparator, Matching
-	from pypika.terms import BasicCriterion, Term  # nosemgrep: frappe-monkey-patching-not-allowed
-
-	class PostgresMatching(Comparator):
-		regex = " ~* "
-
-	def regex(self, pattern: str):
-		comparator = (
-			PostgresMatching.regex if frappe.db and frappe.db.db_type == "postgres" else Matching.regexp
-		)
-		return BasicCriterion(comparator, self, self.wrap_constant(pattern))
-
 	Term.regex = regex  # nosemgrep: frappe-monkey-patching-not-allowed
 
 
@@ -349,5 +445,4 @@ def patch_all():
 	patch_query_execute()
 	patch_query_aggregation()
 	patch_get_query()
-	patch_like_operators()
-	patch_regex_operator()
+	patch_term_operators()
