@@ -2,7 +2,7 @@ from datetime import time
 from enum import Enum
 
 from pypika.functions import *
-from pypika.terms import Arithmetic, ArithmeticExpression, Function, Term
+from pypika.terms import Arithmetic, ArithmeticExpression, Criterion, Function, Term
 from pypika.utils import format_alias_sql
 
 import frappe
@@ -103,11 +103,8 @@ class CurDate(Term):
 
 @per_db_type
 class GroupConcat(GROUP_CONCAT):
-	"""GROUP_CONCAT, rendered as STRING_AGG where that is the spelling.
-
-	MySQL puts the delimiter in a SEPARATOR clause and postgres takes it as a second argument,
-	so the separator travels on the term and each rendering places it itself.
-	"""
+	"""GROUP_CONCAT; STRING_AGG on postgres. The separator travels on the term so each rendering
+	places it."""
 
 	def as_postgres(self, **kwargs):
 		term = STRING_AGG(self.args[0], self._separator, alias=self.alias)
@@ -223,6 +220,83 @@ class DateDiff(Function):
 		return _PostgresDateDiff(*self.args, alias=self.alias).get_sql(**kwargs)
 
 
+# --- intent nodes: emitted by Engine where a comparison is spelled differently per database
+
+
+@per_db_type(default_for="*")
+class NameAsText(Term):
+	"""A document's `name` as text: an autoincrement name is an integer, and postgres does not
+	coerce it when joined to a text column."""
+
+	def __init__(self, field, alias=None):
+		super().__init__(alias)
+		self.field = field
+
+	def nodes_(self):
+		yield self
+		yield from self.field.nodes_()
+
+	def get_sql(self, **kwargs):
+		return self.field.get_sql(**kwargs)
+
+	def as_postgres(self, **kwargs):
+		return Cast(self.field, "varchar").get_sql(**kwargs)
+
+
+@per_db_type(default_for={"mariadb", "sqlite"})
+class IsSet(Criterion):
+	"""`is set` / `is not set`. MariaDB and SQLite coerce '' to the column type; postgres needs the
+	type's null fallback (0, '0001-01-01', ...)."""
+
+	def __init__(self, field, doctype, fieldname, *, negate=False, alias=None):
+		super().__init__(alias)
+		self.field, self.doctype, self.fieldname, self.negate = field, doctype, fieldname, negate
+		self.default = self._criterion("")  # built once; the common render path only prints it
+
+	def nodes_(self):
+		yield self
+		yield from self.field.nodes_()
+
+	def _criterion(self, empty):
+		if self.negate:
+			return self.field.isnull() | (self.field == empty)
+		return self.field != empty
+
+	def get_sql(self, **kwargs):
+		return self.default.get_sql(**kwargs)
+
+	def as_postgres(self, **kwargs):
+		from frappe.database.utils import get_null_fallback
+
+		return self._criterion(get_null_fallback(self.doctype, self.fieldname)).get_sql(**kwargs)
+
+
+def IsNotSet(field, doctype, fieldname, alias=None):
+	return IsSet(field, doctype, fieldname, negate=True, alias=alias)
+
+
+@per_db_type(default_for={"mariadb", "sqlite"})
+class TextLike(Criterion):
+	"""LIKE / NOT LIKE / ILIKE on a non-text column: postgres needs the column cast to text first.
+	`apply` is the operator function from `OPERATOR_MAP`."""
+
+	def __init__(self, field, value, apply, alias=None):
+		super().__init__(alias)
+		self.field, self.value, self.apply = field, self.wrap_constant(value), apply
+		self.default = apply(self.field, self.value)  # built once; the common render path only prints it
+
+	def nodes_(self):
+		yield self
+		yield from self.field.nodes_()
+		yield from self.value.nodes_()
+
+	def get_sql(self, **kwargs):
+		return self.default.get_sql(**kwargs)
+
+	def as_postgres(self, **kwargs):
+		return self.apply(Cast(self.field, "varchar"), self.value).get_sql(**kwargs)
+
+
 class _MariaDBJSONExtract(Function):
 	def __init__(self, field, path, **kwargs):
 		super().__init__("JSON_EXTRACT", field, path, **kwargs)
@@ -244,11 +318,8 @@ class _MariaDBJSONContains(Function):
 
 @per_db_type
 class JSONExtract(_MariaDBJSONExtract):
-	"""JSON_EXTRACT(field, path); postgres has the `->` operator.
-
-	The postgres renderings of the three JSON terms are pypika operators built from the `Field`
-	itself, so they read `raw_args` rather than the wrapped `args`.
-	"""
+	"""JSON_EXTRACT(field, path); postgres has the `->` operator. The JSON terms build postgres
+	operators from the `Field` itself, so they read `raw_args`."""
 
 	def as_postgres(self, **kwargs):
 		field, path = self.raw_args
@@ -275,12 +346,8 @@ class JSONContains(_MariaDBJSONContains):
 
 @per_db_type(default_for="*")
 class Cast_(Function):
-	"""CAST(value AS type).
-
-	MariaDB has no VARCHAR cast (https://mariadb.com/kb/en/cast/#description), so a varchar cast
-	is spelled `CONCAT(value, '')` there -- ref https://stackoverflow.com/a/32542095. Every other
-	database, and every other type, takes the plain CAST.
-	"""
+	"""CAST(value AS type). MariaDB has no VARCHAR cast (https://mariadb.com/kb/en/cast/#description):
+	a varchar cast is CONCAT(value, '') there."""
 
 	def __init__(self, value, as_type, alias=None):
 		# from source: https://pypika.readthedocs.io/en/latest/_modules/pypika/functions.html#Cast

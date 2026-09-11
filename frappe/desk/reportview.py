@@ -1073,7 +1073,8 @@ def get_match_cond(doctype, as_condition=True):
 	if not as_condition:
 		return cond
 
-	return ((" and (" + cond + ")") if cond else "").replace("%", "%%")
+	sql = frappe.qb.render(cond, with_namespace=True) if cond else ""
+	return ((" and (" + sql + ")") if sql else "").replace("%", "%%")
 
 
 def build_match_conditions(doctype, user=None, as_condition=True):
@@ -1083,7 +1084,8 @@ def build_match_conditions(doctype, user=None, as_condition=True):
 	engine.get_query(doctype, user=user, db_query_compat=True)
 	match_conditions = engine.build_match_conditions(as_condition=as_condition)
 	if as_condition:
-		return match_conditions.replace("%", "%%")
+		sql = frappe.qb.render(match_conditions, with_namespace=True) if match_conditions else ""
+		return sql.replace("%", "%%")
 	return match_conditions
 
 
@@ -1121,11 +1123,12 @@ def get_filters_cond(doctype, filters, conditions, ignore_permissions=None, with
 		engine = Engine()
 		engine.get_query(doctype, ignore_permissions=ignore_permissions, db_query_compat=True)
 
-		if with_match_conditions:
-			if match_cond := engine.build_match_conditions():
-				conditions.append(match_cond)
-
-		engine.build_filter_conditions(flt, conditions)
+		criteria = []
+		if with_match_conditions and (match_cond := engine.build_match_conditions()):
+			criteria.append(match_cond)
+		engine.build_filter_conditions(flt, criteria)
+		# text is assembled here, so this is where the criteria are rendered
+		conditions.extend(frappe.qb.render(c, with_namespace=True) for c in criteria)
 
 		cond = " and " + " and ".join(conditions) if conditions else ""
 	else:

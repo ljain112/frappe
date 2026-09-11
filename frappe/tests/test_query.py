@@ -2289,11 +2289,11 @@ class TestQuery(IntegrationTestCase):
 
 	def test_distinct_drops_unselected_order_by_on_postgres(self):
 		if frappe.db.db_type == "postgres":
+			# the ORDER BY is dropped when the query renders for postgres, so the warning fires there
+			query = frappe.qb.get_query("User", fields=["user_type"], distinct=True, order_by="creation desc")
 			with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
-				query = frappe.qb.get_query(
-					"User", fields=["user_type"], distinct=True, order_by="creation desc"
-				)
-			self.assertNotIn("order by", query.get_sql().lower())
+				sql = query.get_sql()
+			self.assertNotIn("order by", sql.lower())
 		else:
 			query = frappe.qb.get_query("User", fields=["user_type"], distinct=True, order_by="creation desc")
 			self.assertIn("order by", query.get_sql().lower())
@@ -2320,14 +2320,15 @@ class TestQuery(IntegrationTestCase):
 	def test_distinct_order_by_preserves_link_table_identity(self):
 		for order_by in ("creation desc", "`tabUser`.`creation` desc"):
 			with self.subTest(order_by=order_by):
+				query = frappe.qb.get_query(
+					"User",
+					fields=["language.creation as language_creation"],
+					distinct=True,
+					order_by=order_by,
+				)
 				with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
-					query = frappe.qb.get_query(
-						"User",
-						fields=["language.creation as language_creation"],
-						distinct=True,
-						order_by=order_by,
-					)
-				self.assertNotIn("order by", query.get_sql().lower())
+					sql = query.get_sql()
+				self.assertNotIn("order by", sql.lower())
 				query.run()
 
 		for order_by in ("language_creation asc", "language.creation asc"):
@@ -2377,11 +2378,12 @@ class TestQuery(IntegrationTestCase):
 	def test_distinct_drops_invalid_result_position(self):
 		for position in (0, 2):
 			with self.subTest(position=position):
+				query = frappe.qb.get_query(
+					"User", fields=["user_type"], distinct=True, order_by=f"{position} asc"
+				)
 				with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
-					query = frappe.qb.get_query(
-						"User", fields=["user_type"], distinct=True, order_by=f"{position} asc"
-					)
-				self.assertNotIn("order by", query.get_sql().lower())
+					sql = query.get_sql()
+				self.assertNotIn("order by", sql.lower())
 				query.run()
 
 	def test_field_alias_permission_check(self):
@@ -3028,7 +3030,7 @@ class TestQuery(IntegrationTestCase):
 
 	def test_limit_offset_query(self):
 		"""Test if query builder correctly uses limit with offset in MariaDB and SQLite when limit is omitted."""
-		from frappe.database.query import MAX_LIMIT
+		from frappe.query_builder.utils import MAX_LIMIT
 
 		query = frappe.qb.get_query("Doctype", offset=10).get_sql()
 		if frappe.db.db_type != "postgres":
@@ -3044,11 +3046,10 @@ class TestQuery(IntegrationTestCase):
 		"""A filter value ending in a backslash must not let its string literal
 		swallow the next condition as live SQL.
 
-		Engine.build_filter_conditions renders filter values via pypika, which
-		only doubles quote characters, not backslashes. On MariaDB's default
-		sql_mode a trailing backslash escapes the closing quote, so two chained
-		filters on the same field could splice arbitrary SQL into the
-		surrounding WHERE clause.
+		pypika only doubles quote characters, not backslashes. On MariaDB's
+		default sql_mode a trailing backslash escapes the closing quote, so two
+		chained filters on the same field could splice arbitrary SQL into the
+		surrounding WHERE clause. The MariaDB rendering doubles them.
 		"""
 		from frappe.database.query import Engine
 
@@ -3065,7 +3066,7 @@ class TestQuery(IntegrationTestCase):
 			],
 			conditions,
 		)
-		cond = " and ".join(conditions)
+		cond = " and ".join(frappe.qb.render(c, with_namespace=True) for c in conditions)
 
 		# The backslash must be doubled so it stays inside its own literal
 		# instead of escaping the closing quote and exposing `tail` as code.
@@ -3088,7 +3089,7 @@ class TestQuery(IntegrationTestCase):
 		engine.get_query("ToDo", db_query_compat=True)
 		conditions = []
 		engine.build_filter_conditions([["ToDo", "description", "=", r"C:\Users\test"]], conditions)
-		cond = " and ".join(conditions)
+		cond = " and ".join(frappe.qb.render(c, with_namespace=True) for c in conditions)
 
 		rows = frappe.db.sql(f"SELECT name FROM `tabToDo` WHERE 1=1 and {cond}", as_dict=True)
 		self.assertIn(todo.name, [r.name for r in rows])

@@ -8,7 +8,7 @@ from pypika.terms import ValueWrapper
 
 import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
-from frappe.database.operator_map import func_in
+from frappe.database.operator_map import OPERATOR_MAP, func_in
 from frappe.query_builder import Case
 from frappe.query_builder.builder import Function
 from frappe.query_builder.custom import ConstantColumn, MonthName, Year
@@ -21,14 +21,18 @@ from frappe.query_builder.functions import (
 	DateDiff,
 	DateFormat,
 	GroupConcat,
+	IsNotSet,
+	IsSet,
 	JSONContains,
 	JSONExtract,
 	JSONValue,
 	Locate,
 	Match,
 	Month,
+	NameAsText,
 	Quarter,
 	Round,
+	TextLike,
 	Timestamp,
 	Truncate,
 	UnixTimestamp,
@@ -36,8 +40,13 @@ from frappe.query_builder.functions import (
 )
 from frappe.query_builder.utils import (
 	DB_TYPES,
+	MAX_LIMIT,
+	SHAPE_RULES,
+	DbType,
 	PseudoColumnMapper,
+	QueryShape,
 	UnsupportedOperation,
+	compile_query,
 	db_type_is,
 	per_db_type,
 )
@@ -1015,7 +1024,20 @@ class TestDbTypeMatrix(IntegrationTestCase):
 	# (a fulltext index, a JSON column, a real identifier) and are render-only everywhere
 	DATE = Cast("2021-01-05", "date")
 	FIELD_ONLY = frozenset(
-		{"Match", "JSONExtract", "JSONValue", "JSONContains", "Like", "NotLike", "Regex", "PseudoColumn"}
+		{
+			"Match",
+			"JSONExtract",
+			"JSONValue",
+			"JSONContains",
+			"Like",
+			"NotLike",
+			"Regex",
+			"PseudoColumn",
+			"NameAsText",
+			"IsSet",
+			"IsNotSet",
+			"TextLike",
+		}
 	)
 	UNSUPPORTED = frozenset(
 		("sqlite", name)
@@ -1064,6 +1086,10 @@ class TestDbTypeMatrix(IntegrationTestCase):
 			"NotLike": column.not_like("a%"),
 			"Regex": column.regex("^a"),
 			"PseudoColumn": PseudoColumnMapper("`tabDocType`.`name`"),
+			"NameAsText": NameAsText(doctype.name),
+			"IsSet": IsSet(doctype.idx, "DocType", "idx"),
+			"IsNotSet": IsNotSet(doctype.modified, "DocType", "modified"),
+			"TextLike": TextLike(doctype.idx, "1%", OPERATOR_MAP["like"]),
 			"Round": Round("1.234", 2),
 			"Truncate": Truncate("1.234", 2),
 			"Timestamp": Timestamp("2021-01-05"),
@@ -1111,3 +1137,172 @@ class TestDbTypeMatrix(IntegrationTestCase):
 					self.assertRaises(sqlite3.OperationalError, connection.execute, sql)
 				else:
 					connection.execute(sql).fetchone()
+
+
+class TestCompileQuery(IntegrationTestCase):
+	"""`compile_query` shapes a tree for the database it renders for, and only for that one."""
+
+	def setUp(self):
+		self.note = frappe.qb.DocType("Note")
+
+	def render(self, query, db_type):
+		spec = DB_TYPES[db_type_is(db_type)]
+		return query.get_sql(dialect=spec.pypika, quote_char=spec.builder._BuilderClasss.QUOTE_CHAR)
+
+	def test_offset_gets_a_limit_only_where_required(self):
+		query = frappe.qb.from_(self.note).select(self.note.name).offset(5)
+		self.assertIn(f"LIMIT {MAX_LIMIT} OFFSET 5", self.render(query, "mariadb"))
+		self.assertIn(f"LIMIT {MAX_LIMIT} OFFSET 5", self.render(query, "sqlite"))
+		self.assertNotIn("LIMIT", self.render(query, "postgres"))
+		# an explicit limit is never replaced
+		query = frappe.qb.from_(self.note).select(self.note.name).limit(3).offset(5)
+		self.assertIn("LIMIT 3 OFFSET 5", self.render(query, "mariadb"))
+
+	def test_index_hints_are_dropped_where_unsupported(self):
+		query = frappe.qb.from_(self.note).select(self.note.name).force_index("idx_title")
+		self.assertIn("FORCE INDEX", self.render(query, "mariadb"))
+		self.assertNotIn("FORCE INDEX", self.render(query, "postgres"))
+		self.assertNotIn("FORCE INDEX", self.render(query, "sqlite"))
+
+	def test_distinct_drops_unselected_order_by_only_where_required_and_warns(self):
+		query = frappe.qb.from_(self.note).select(self.note.title).distinct().orderby(self.note.modified)
+		query._shape = QueryShape(order_by_unselected=True)  # what Engine records
+		self.assertIn("ORDER BY", self.render(query, "mariadb"))
+		with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
+			self.assertNotIn("ORDER BY", self.render(query, "postgres"))
+		# without the annotation nothing is dropped anywhere
+		query._shape = QueryShape()
+		self.assertIn("ORDER BY", self.render(query, "postgres"))
+
+	def test_strict_group_by_applies_engine_annotations(self):
+		user = frappe.qb.DocType("User")
+		ordered = self.note.modified
+		query = (
+			frappe.qb.from_(self.note)
+			.left_join(user)
+			.on(user.name == self.note.owner)
+			.select(self.note.name, user.full_name)
+			.groupby(self.note.name)
+			.orderby(ordered)
+		)
+		query._shape = QueryShape(
+			group_by_extension=(user.name,), aggregate_order_terms=frozenset({id(ordered)})
+		)
+		mariadb, postgres = self.render(query, "mariadb"), self.render(query, "postgres")
+		self.assertIn("GROUP BY `tabNote`.`name` ORDER BY `tabNote`.`modified`", mariadb)
+		self.assertIn(
+			'GROUP BY "tabNote"."name","tabUser"."name" ORDER BY MAX("tabNote"."modified")', postgres
+		)
+
+	def test_compile_never_mutates_the_query(self):
+		query = (
+			frappe.qb.from_(self.note)
+			.select(self.note.title)
+			.distinct()
+			.orderby(self.note.modified)
+			.offset(2)
+		)
+		query._shape = QueryShape(order_by_unselected=True)
+		before = (list(query._orderbys), query._limit, list(query._groupbys))
+		with self.assertWarns(UserWarning):
+			self.render(query, "postgres")
+		self.render(query, "mariadb")
+		self.assertEqual(before, (list(query._orderbys), query._limit, list(query._groupbys)))
+		# and a second render for the same database gives the same text
+		self.assertEqual(self.render(query, "mariadb"), self.render(query, "mariadb"))
+
+	def test_unknown_dialect_raises_instead_of_rendering_unshaped(self):
+		query = frappe.qb.from_(self.note).select(self.note.name).offset(5)
+		with self.assertRaises(UnsupportedOperation) as raised:
+			compile_query(query, dialect="clickhouse")
+		self.assertIn("add a DbType row", str(raised.exception))
+
+	def test_each_rule_is_a_no_op_without_its_flag(self):
+		# a DbType with every flag off (index hints allowed, so that rule has nothing to strip):
+		# no rule may touch the query, whatever Engine recorded on it
+		bare = DbType("bare", frappe.qb, Dialects.MYSQL, supports_index_hints=True)
+		user = frappe.qb.DocType("User")
+		ordered = self.note.modified
+		query = (
+			frappe.qb.from_(self.note)
+			.left_join(user)
+			.on(user.name == self.note.owner)
+			.select(self.note.title)
+			.distinct()
+			.groupby(self.note.name)
+			.orderby(ordered)
+			.offset(2)
+			.force_index("idx")
+		)
+		query._shape = QueryShape(
+			order_by_unselected=True,
+			group_by_extension=(user.name,),
+			aggregate_order_terms=frozenset({id(ordered)}),
+		)
+		for rule in SHAPE_RULES:
+			with self.subTest(rule=rule.__name__):
+				self.assertIs(rule(query, bare), query)  # untouched, not even copied
+
+	def test_default_shape_changes_nothing_on_a_strict_database(self):
+		query = frappe.qb.from_(self.note).select(self.note.title).distinct().orderby(self.note.modified)
+		query._shape = QueryShape()
+		self.assertIn("ORDER BY", self.render(query, "postgres"))
+
+
+class TestEngineIsDatabaseNeutral(IntegrationTestCase):
+	"""One Engine-built tree renders correctly for every database: no database is consulted
+	while building, only while rendering."""
+
+	def render(self, query, db_type):
+		spec = DB_TYPES[db_type_is(db_type)]
+		return query.get_sql(dialect=spec.pypika, quote_char=spec.builder._BuilderClasss.QUOTE_CHAR)
+
+	def test_same_tree_two_databases(self):
+		query = frappe.qb.get_query(
+			"ToDo", fields=["name"], filters={"idx": ["is", "set"], "description": ["like", "%x%"]}, offset=5
+		)
+		self.assertEqual(
+			f"SELECT `name` FROM `tabToDo` WHERE `idx`<>'' AND `description` LIKE '%x%' LIMIT {MAX_LIMIT} OFFSET 5",
+			self.render(query, "mariadb"),
+		)
+		self.assertEqual(
+			"""SELECT "name" FROM "tabToDo" WHERE "idx"<>0 AND "description" ILIKE '%x%' OFFSET 5""",
+			self.render(query, "postgres"),
+		)
+
+	def test_is_set_on_a_date_column(self):
+		query = frappe.qb.get_query("ToDo", fields=["name"], filters={"date": ["is", "not set"]})
+		self.assertIn("`date` IS NULL OR `date`=''", self.render(query, "mariadb"))
+		self.assertIn(""""date" IS NULL OR "date"='0001-01-01'""", self.render(query, "postgres"))
+
+	def test_like_on_a_non_text_column(self):
+		query = frappe.qb.get_query("ToDo", fields=["name"], filters={"idx": ["like", "1%"]})
+		self.assertIn("`idx` LIKE '1%'", self.render(query, "mariadb"))
+		self.assertIn("""CAST("idx" AS VARCHAR) ILIKE '1%'""", self.render(query, "postgres"))
+
+	def test_aggregate_order_by_under_strict_group_by(self):
+		query = frappe.qb.get_query(
+			"ToDo",
+			fields=["status", {"COUNT": "name", "as": "n"}],
+			group_by="status",
+			order_by="modified desc",
+		)
+		self.assertIn("ORDER BY `modified` DESC", self.render(query, "mariadb"))
+		self.assertIn('ORDER BY MAX("modified") DESC', self.render(query, "postgres"))
+
+	def test_postgres_modify_query_leaves_query_builder_output_alone(self):
+		# raw frappe.db.sql strings written in MariaDB spelling are rewritten textually for
+		# postgres; query-builder output is already postgres and must pass through untouched
+		from frappe.database.postgres.database import modify_query
+
+		for query in (
+			frappe.qb.get_query(
+				"ToDo", fields=["name", "allocated_to.full_name"], filters={"idx": ["like", "1%"]}
+			),
+			frappe.qb.get_query("ToDo", fields=["name"], filters={"date": ["is", "not set"]}, offset=5),
+			frappe.qb.get_query(
+				"User", fields=["name", "roles.role"], filters={"roles.role": "System Manager"}
+			),
+		):
+			sql = self.render(query, "postgres")
+			self.assertEqual(sql, modify_query(sql))

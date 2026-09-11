@@ -1,12 +1,15 @@
+import copy
 import functools
 import inspect
 import types
+import warnings
 from enum import Enum
 from importlib import import_module
 from typing import Any, NamedTuple, get_type_hints
 
 from pypika import Dialects
 from pypika.enums import Comparator, Matching
+from pypika.functions import Max
 from pypika.queries import Column, QueryBuilder, _SetOperation
 from pypika.terms import BasicCriterion, PseudoColumn
 
@@ -23,21 +26,39 @@ class db_type_is(Enum):
 
 
 class DbType(NamedTuple):
-	"""One database backend, as the query builder sees it."""
+	"""One database, as the query builder sees it. The flags are read only by `compile_query`."""
 
 	#: the `db_type` name; `per_db_type` dispatches to `as_<name>()`
 	name: str
 	builder: type
-	#: what pypika threads down the render tree as `dialect`. Its own members are kept rather
-	#: than replaced because pypika reads them itself (`Array` renders ARRAY[...] on postgres;
-	#: `Interval` and `Now` have sqlite spellings).
+	#: pypika's dialect for this database; kept because pypika reads it itself (Array, Interval, Now)
 	pypika: Dialects
+	#: OFFSET is a syntax error without a LIMIT before it
+	offset_requires_limit: bool = False
+	#: with DISTINCT, every ORDER BY column must appear in the select list
+	distinct_order_by_must_be_selected: bool = False
+	#: a selected column must be grouped or aggregated (functional-dependency rule)
+	strict_group_by: bool = False
+	#: FORCE INDEX / USE INDEX are accepted
+	supports_index_hints: bool = False
 
 
 DB_TYPES = {
-	db_type_is.MARIADB: DbType("mariadb", MariaDB, Dialects.MYSQL),
-	db_type_is.POSTGRES: DbType("postgres", Postgres, Dialects.POSTGRESQL),
-	db_type_is.SQLITE: DbType("sqlite", SQLite, Dialects.SQLLITE),
+	db_type_is.MARIADB: DbType(
+		"mariadb",
+		MariaDB,
+		Dialects.MYSQL,
+		offset_requires_limit=True,
+		supports_index_hints=True,
+	),
+	db_type_is.POSTGRES: DbType(
+		"postgres",
+		Postgres,
+		Dialects.POSTGRESQL,
+		distinct_order_by_must_be_selected=True,
+		strict_group_by=True,
+	),
+	db_type_is.SQLITE: DbType("sqlite", SQLite, Dialects.SQLLITE, offset_requires_limit=True),
 }
 
 assert set(DB_TYPES) == set(db_type_is), "DB_TYPES must describe every db_type_is member"
@@ -45,12 +66,105 @@ assert set(DB_TYPES) == set(db_type_is), "DB_TYPES must describe every db_type_i
 # derived views; add a database as one row in DB_TYPES, never here
 DB_TYPE_MAP = {key: backend.builder for key, backend in DB_TYPES.items()}
 _DB_TYPE_NAMES = {backend.pypika: backend.name for backend in DB_TYPES.values()}
+_DB_TYPES_BY_NAME = {backend.name: backend for backend in DB_TYPES.values()}
+
+#: the largest LIMIT MariaDB accepts; stands in for "no limit" where OFFSET needs one
+MAX_LIMIT = 18446744073709551615
 
 
-# the site's builder is the default for a term rendered outside a query -- a bare `term.get_sql()`
-# in a test or a helper. Inside a query pypika supplies `dialect` at the root, so this is never
-# consulted on a real query path. Keyed by builder so the fallback is exactly what `frappe.qb`
-# would have used, with no config parsing per render.
+class QueryShape(NamedTuple):
+	"""What a stricter database would need of a query: recorded by `Engine` at build, applied by
+	`SHAPE_RULES` at render. Describes the tree as built; later `.orderby()` / `.select()` calls
+	are not reflected."""
+
+	#: DISTINCT with an ORDER BY column that is not in the select list
+	order_by_unselected: bool = False
+	#: primary keys of 1:1 joined link tables, to add to a GROUP BY on the main table's key
+	group_by_extension: tuple = ()
+	#: id() of ORDER BY terms an aggregate query must wrap in Max()
+	aggregate_order_terms: frozenset = frozenset()
+
+
+def _shape_of(query) -> QueryShape:
+	# vars(), not getattr(): a pypika builder returns a Field for any unknown attribute
+	return vars(query).get("_shape") or QueryShape()
+
+
+def limit_before_offset(query, spec: DbType):
+	if spec.offset_requires_limit and query._offset and query._limit is None:
+		query = copy.copy(query)
+		query._limit = MAX_LIMIT
+	return query
+
+
+def drop_unselected_order_by(query, spec: DbType):
+	if not (spec.distinct_order_by_must_be_selected and query._distinct and query._orderbys):
+		return query
+	if not _shape_of(query).order_by_unselected:
+		return query
+	query = copy.copy(query)
+	query._orderbys = []
+	warnings.warn(
+		"ORDER BY fields have been ignored because PostgreSQL requires them to "
+		"appear in the SELECT list when using with DISTINCT",
+		UserWarning,
+		stacklevel=5,
+	)
+	return query
+
+
+def extend_group_by(query, spec: DbType):
+	if spec.strict_group_by and (extension := _shape_of(query).group_by_extension):
+		query = copy.copy(query)
+		query._groupbys = [*query._groupbys, *extension]
+	return query
+
+
+def aggregate_order_by(query, spec: DbType):
+	if spec.strict_group_by and (terms := _shape_of(query).aggregate_order_terms):
+		query = copy.copy(query)
+		query._orderbys = [
+			(Max(term) if id(term) in terms else term, order) for term, order in query._orderbys
+		]
+	return query
+
+
+def strip_index_hints(query, spec: DbType):
+	if not spec.supports_index_hints and (query._force_indexes or query._use_indexes):
+		query = copy.copy(query)
+		query._force_indexes, query._use_indexes = [], []
+	return query
+
+
+#: applied in this order; each returns the query untouched unless the database's flag asks for a change
+SHAPE_RULES = (
+	limit_before_offset,
+	drop_unselected_order_by,
+	extend_group_by,
+	aggregate_order_by,
+	strip_index_hints,
+)
+
+
+def compile_query(query, dialect=None):
+	"""Shape `query` for the database it is about to be rendered for.
+
+	A rule that changes something works on a shallow copy, so the original renders again
+	unchanged. The only reader of the `DbType` flags. An unknown dialect raises rather than rendering unshaped SQL.
+	"""
+	dialect = dialect or vars(query).get("dialect")
+	spec = _DB_TYPES_BY_NAME.get(_DB_TYPE_NAMES.get(dialect))
+	if spec is None:
+		raise UnsupportedOperation(type(query), str(dialect), hint="add a DbType row for it in DB_TYPES")
+
+	# each rule copies only when it changes something, so the common case renders the tree as is
+	for rule in SHAPE_RULES:
+		query = rule(query, spec)
+	return query
+
+
+# default dialect for a term rendered outside a query (a bare `term.get_sql()`): the site's
+# builder. Inside a query pypika supplies `dialect` at the root.
 _PYPIKA_BY_BUILDER = {backend.builder: backend.pypika for backend in DB_TYPES.values()}
 _RENDERER_ATTRS = {name: f"as_{name}" for name in _DB_TYPE_NAMES.values()}
 
@@ -63,36 +177,22 @@ BASE_DB_TYPE = db_type_is.MARIADB.value
 class UnsupportedOperation(NotImplementedError):
 	"""A term has no rendering for the database it is being rendered for."""
 
-	def __init__(self, term: type, db_type: str) -> None:
-		super().__init__(
-			f"{term.__name__} cannot be rendered for {db_type}: "
-			f"define {term.__name__}.as_{db_type}() or list {db_type!r} in default_for"
-		)
+	def __init__(self, term: type, db_type: str, hint: str | None = None) -> None:
+		hint = hint or f"define {term.__name__}.as_{db_type}() or list {db_type!r} in default_for"
+		super().__init__(f"{term.__name__} cannot be rendered for {db_type}: {hint}")
 
 
 def per_db_type(cls=None, *, default_for: str | set[str] = BASE_DB_TYPE):
-	"""Let a term render differently per database, following Django's `as_<vendor>()` convention.
+	"""Render a term per database, following Django's `as_<vendor>()` convention.
 
-	A term that renders the same everywhere needs nothing. A term whose spelling differs is
-	decorated and defines `as_postgres()` / `as_sqlite()` / ... for each database that differs
-	from its default rendering. Rendering picks `as_<db_type>()` when the class defines it, the
-	default when the database is one `default_for` names, and raises `UnsupportedOperation`
-	otherwise -- a database the term does not know is an error, not a silent wrong spelling.
+	Decorate a term whose spelling differs and define `as_postgres()` / `as_sqlite()` / ... for
+	each database that differs from the default rendering. `default_for` names the databases the
+	default is written for: `BASE_DB_TYPE` unless given, a set, or `"*"` for all. A database with
+	no method and not in `default_for` raises `UnsupportedOperation`.
 
-	`default_for` says which databases the default rendering is written for. Left alone it is
-	`BASE_DB_TYPE`, which is true of every term in frappe today; pass a set when the default is
-	right on several (`default_for={"mariadb", "sqlite"}`) or `"*"` when it is right everywhere
-	and the methods are exceptions.
-
-	The database comes from the `dialect` pypika threads through the whole render tree, rather
-	than from `frappe.conf.db_type` at construction: the same term object renders correctly
-	wherever it is sent, and another database is an added method rather than an edit to a
-	dispatch table.
-
-	The decorator also keeps `self.raw_args` -- the operands as the caller passed them. pypika's
-	`Function.__init__` wraps every operand in a `ValueWrapper` before an `as_*` method can look
-	at it, so a rendering that must inspect an operand (cast a `str` to DATE, call a `Field`
-	method) reads `raw_args`, not `self.args`.
+	The database is the `dialect` pypika passes at render, never `frappe.conf.db_type` at
+	construction. `self.raw_args` keeps the operands as passed, because pypika wraps them before
+	an `as_*` method can inspect them.
 
 	    @per_db_type
 	    class GroupConcat(GROUP_CONCAT):

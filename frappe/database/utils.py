@@ -97,6 +97,48 @@ def is_non_text_field(doctype: str, fieldname: str, df=None) -> bool:
 	return bool(db_type) and db_type[0].lower() not in TEXT_SQL_TYPES
 
 
+def get_null_fallback(doctype: str, fieldname: str):
+	"""What an unset value of this column compares to: '' for text, 0 for numbers, '0001-01-01'
+	for dates, '00:00:00' for time -- valid on a database that does not coerce '' (postgres)."""
+	from frappe.model.meta import get_default_df
+
+	try:
+		df = frappe.get_meta(doctype).get_field(fieldname)
+	except Exception:
+		# no meta (a raw table): ask information_schema, which every backend has
+		columns = frappe.qb.Schema("information_schema").columns
+		res = (
+			frappe.qb.from_(columns)
+			.select(columns.data_type)
+			.where(
+				(columns.table_name == frappe.utils.get_table_name(doctype))
+				& (columns.column_name == fieldname)
+				& (columns.table_schema == frappe.conf.get("db_schema", "public"))
+			)
+		).run(pluck=True)
+		return 0 if res and res[0] in ("smallint", "bigint", "int", "numeric") else ""
+
+	if df is None:
+		df = get_default_df(fieldname)
+		if df is None:
+			return ""
+
+	if df.fieldtype in ("Link", "Data", "Dynamic Link"):
+		return ""
+	if df.fieldtype in ("Date", "Datetime"):
+		return "0001-01-01"
+	if df.fieldtype == "Time":
+		return "00:00:00"
+	if df.fieldtype in ("Float", "Int", "Currency", "Percent", "Check"):
+		return 0
+	return ""
+
+
+def as_sql_literal(value) -> str:
+	"""`get_null_fallback` as a SQL literal, the form `Engine` historically used."""
+	return str(value) if isinstance(value, int) else f"'{value}'"
+
+
 def get_query_type(query: str) -> str:
 	return QUERY_TYPE_PATTERN.match(query)[1].lower()
 

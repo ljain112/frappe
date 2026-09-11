@@ -1,6 +1,5 @@
 import datetime
 import re
-import warnings
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -15,9 +14,11 @@ from frappe.database.operator_map import NESTED_SET_OPERATORS, OPERATOR_MAP
 from frappe.database.utils import (
 	DefaultOrderBy,
 	FilterValue,
+	as_sql_literal,
 	convert_to_value,
 	get_doctype_name,
 	get_doctype_sort_info,
+	get_null_fallback,
 	get_order_by_fields,
 	is_non_text_field,
 	is_order_by_in_select,
@@ -28,6 +29,7 @@ from frappe.model.base_document import DOCTYPES_FOR_DOCTYPE
 from frappe.model.document import Document
 from frappe.query_builder import Criterion, Field, Order, functions
 from frappe.query_builder.custom import Month, MonthName, Quarter, Year
+from frappe.query_builder.utils import QueryShape
 
 CORE_DOCTYPES = DOCTYPES_FOR_DOCTYPE | frozenset(
 	(
@@ -44,8 +46,9 @@ CORE_DOCTYPES = DOCTYPES_FOR_DOCTYPE | frozenset(
 
 
 def _cast_autoincrement_name(field: Field, doctype: str) -> Term:
-	if frappe.db.db_type == "postgres" and frappe.get_meta(doctype).autoname == "autoincrement":
-		return functions.Cast(field, "varchar")
+	"""An autoincrement `name` is an integer; `NameAsText` casts it where a database needs that."""
+	if frappe.get_meta(doctype).autoname == "autoincrement":
+		return functions.NameAsText(field)
 	return field
 
 
@@ -138,7 +141,7 @@ def _apply_datetime_field_filter_conversion(between_values: tuple | list, doctyp
 
 
 if TYPE_CHECKING:
-	from frappe.query_builder import DocType
+	pass
 
 TAB_PATTERN = re.compile("^tab")
 WORDS_PATTERN = re.compile(r"\w+")
@@ -182,7 +185,6 @@ BACKTICK_FIELD_PARSE_REGEX = re.compile(r"^`tab([\w\s-]+)`\.(`?)(\w+)\2$")
 CHILD_TABLE_FIELD_PATTERN = re.compile(r'^[`"]?tab([\w\s]+)[`"]?\.([`"]?)(\w+)\2$')
 
 # Maximum value of an unsigned 64-bit integer
-MAX_LIMIT = 18446744073709551615
 
 # Direct mapping from uppercase function names to pypika function classes
 FUNCTION_MAPPING = {
@@ -258,11 +260,6 @@ class Engine:
 		"""
 
 		qb = frappe.local.qb
-		db_type = frappe.local.db.db_type
-
-		self.is_mariadb = db_type == "mariadb"
-		self.is_postgres = db_type == "postgres"
-		self.is_sqlite = db_type == "sqlite"
 		self.user = user or frappe.session.user
 		self.parent_doctype = parent_doctype
 		self.reference_doctype = reference_doctype
@@ -275,8 +272,10 @@ class Engine:
 		self.is_aggregate_query = False
 		self._grouped_queries = set()
 		self._joined_link_tables = []
-
-		assert db_type in ("mariadb", "postgres", "sqlite"), f"unexpected db_type: {db_type}"
+		# recorded while building, written to the query as one QueryShape at the end
+		self._order_by_unselected = False
+		self._group_by_extension = ()
+		self._aggregate_order_terms = set()
 
 		if isinstance(table, Table):
 			self.table = table
@@ -321,10 +320,7 @@ class Engine:
 			if not isinstance(offset, int) or offset < 0:
 				frappe.throw(_("Offset must be a non-negative integer"), TypeError)
 
-			# In MariaDB and SQLite, offset requires limit
-			if not self.is_postgres and not limit:
-				self.query = self.query.limit(MAX_LIMIT)
-
+			# a LIMIT is added at render where the database needs one before OFFSET
 			self.query = self.query.offset(offset)
 
 		if distinct:
@@ -344,24 +340,18 @@ class Engine:
 			self.apply_group_by(group_by)
 
 		if order_by:
-			if not (
-				self.is_postgres
-				and is_select
-				and distinct
-				and not self._can_apply_distinct_order_by(order_by)
-			):
-				self.apply_order_by(order_by)
-			else:
-				warnings.warn(
-					(
-						"ORDER BY fields have been ignored because PostgreSQL requires them to "
-						"appear in the SELECT list when using with DISTINCT"
-					),
-					UserWarning,
-					stacklevel=2,
-				)
+			if is_select and distinct:
+				# noted for render: a database that requires ordered columns to be selected drops it
+				self._order_by_unselected = not self._can_apply_distinct_order_by(order_by)
+			self.apply_order_by(order_by)
 
 		self.add_permission_conditions()
+
+		self.query._shape = QueryShape(
+			order_by_unselected=self._order_by_unselected,
+			group_by_extension=tuple(self._group_by_extension),
+			aggregate_order_terms=frozenset(self._aggregate_order_terms),
+		)
 
 		if self.apply_permissions:
 			# Store metadata for masked field processing during execution.
@@ -720,13 +710,8 @@ class Engine:
 			)
 			return operator_fn(_field, nodes or ("",))
 
-		# The `is` ("set"/"not set") operator compares against an empty string (`= ''`).
-		# MariaDB silently coerces `''` to the column's type (e.g. `0` for an int), but
-		# postgres rejects `date/numeric = ''` outright. Compare against the
-		# type-appropriate fallback instead so the same filter behaves identically on both
-		# backends (for a column that coerces `''` to its zero-value on MariaDB, the typed
-		# fallback yields the exact same match set). MariaDB keeps its existing path.
-		if self.is_postgres and _operator.casefold() == "is" and isinstance(_field, Field):
+		# spelled per column type and database at render (postgres cannot compare a date or int to '')
+		if _operator.casefold() == "is" and isinstance(_field, Field):
 			value_token = str(_value).strip().lower()
 			if value_token in ("set", "not set"):
 				is_field_name = (
@@ -736,28 +721,10 @@ class Engine:
 				)
 				if "." in is_field_name:
 					is_field_name = is_field_name.split(".")[-1]
+				return functions.IsSet(_field, filter_doctype, is_field_name, negate=value_token == "not set")
 
-				fallback_sql = self._get_ifnull_fallback(filter_doctype, is_field_name)
-				if fallback_sql == "''":
-					fallback_value = ""
-				elif fallback_sql.startswith("'") and fallback_sql.endswith("'"):
-					fallback_value = fallback_sql[1:-1]
-				else:
-					try:
-						fallback_value = int(fallback_sql)
-					except (ValueError, TypeError):
-						fallback_value = fallback_sql
-
-				if value_token == "set":
-					return _field != fallback_value
-				return _field.isnull() | (_field == fallback_value)
-
-		if (
-			self.is_postgres and _operator.casefold() == "like"
-		):  # use `ILIKE` to support case insensitive search in postgres
-			operator_fn = OPERATOR_MAP["ilike"]
-		else:
-			operator_fn = OPERATOR_MAP[_operator.casefold()]
+		# LikeCriterion renders ILIKE on postgres itself
+		operator_fn = OPERATOR_MAP[_operator.casefold()]
 		if _value is None and isinstance(_field, Field):
 			if operator_fn == builtin_operator.ne:
 				filter_field_name = (
@@ -817,12 +784,11 @@ class Engine:
 
 				_field = functions.IfNull(_field, ValueWrapper(fallback_value))
 
-			if (
-				self.is_postgres
-				and _operator.casefold() in ("like", "not like", "ilike")
-				and is_non_text_field(target_doctype, filter_field_name)
+			if _operator.casefold() in ("like", "not like", "ilike") and is_non_text_field(
+				target_doctype, filter_field_name
 			):
-				_field = functions.Cast(_field, "varchar")
+				# TextLike casts the column at render where the database needs it
+				return functions.TextLike(_field, _value, operator_fn)
 
 			return operator_fn(_field, _value)
 
@@ -1316,29 +1282,33 @@ class Engine:
 			# Note: Comma handling is done in parse_fields before this method is called
 			return self.parse_string_field(field)
 
-	def _normalize_postgres_order_field(self, field):
-		"""In PostgreSQL order_by fields need to either be in group_by or be aggregated
-		when used with select and group_by"""
-		# DISTINCT ordering already refers to selected expressions. Wrapping them would
-		# create an unselected expression and PostgreSQL would reject the query.
+	def _needs_aggregate_under_strict_group_by(self, field) -> bool:
+		"""Would a strict-GROUP BY database reject this ORDER BY term: ungrouped, unaliased and not
+		an aggregate? DISTINCT ordering is exempt -- it must refer to selected expressions."""
 		if self.query._distinct or isinstance(field, int):
-			return field
+			return False
 		current_sql = field.get_sql() if hasattr(field, "get_sql") else str(field)
 		if current_sql in self._grouped_queries:
-			return field
-		clean_name = current_sql.strip('"')
-		if clean_name in self.field_aliases:
-			return field
-		if not isinstance(field, functions.AggregateFunction):
-			return functions.Max(field)
-		return field
+			return False
+		if current_sql.strip('"') in self.field_aliases:
+			return False
+		return not isinstance(field, functions.AggregateFunction)
+
+	def _add_order_by(self, field, order):
+		"""Append ORDER BY, noting the terms a strict-GROUP BY database must wrap in Max() at render."""
+		if self.is_aggregate_query and self._needs_aggregate_under_strict_group_by(field):
+			self._aggregate_order_terms.add(id(field))
+		self.query = self.query.orderby(field, order=order)
 
 	def apply_group_by(self, group_by: str | None = None):
 		parsed_group_by_fields = self._validate_group_by(group_by)
-		if self.is_postgres and self._is_main_table_pk_group_by(parsed_group_by_fields):
-			parsed_group_by_fields += self._joined_link_table_pks()
+		extension = (
+			self._joined_link_table_pks() if self._is_main_table_pk_group_by(parsed_group_by_fields) else []
+		)
+		# appended at render on a strict-GROUP BY database; the tree groups as asked
+		self._group_by_extension = extension
 		self._grouped_queries = {
-			f.get_sql() if hasattr(f, "get_sql") else str(f) for f in parsed_group_by_fields
+			f.get_sql() if hasattr(f, "get_sql") else str(f) for f in (*parsed_group_by_fields, *extension)
 		}
 		self.query = self.query.groupby(*parsed_group_by_fields)
 
@@ -1373,12 +1343,7 @@ class Engine:
 
 		parsed_order_fields = self._validate_order_by(order_by)
 		for order_field, order_direction in parsed_order_fields:
-			if self.is_postgres and self.is_aggregate_query:
-				self.query = self.query.orderby(
-					self._normalize_postgres_order_field(order_field), order=order_direction
-				)
-			else:
-				self.query = self.query.orderby(order_field, order=order_direction)
+			self._add_order_by(order_field, order_direction)
 
 	def _can_apply_distinct_order_by(self, order_by: str) -> bool:
 		if not isinstance(order_by, str):
@@ -1436,24 +1401,14 @@ class Engine:
 						order_direction = Order.desc if spec_order == "desc" else Order.asc
 					else:
 						order_direction = Order.asc if spec_order == "asc" else Order.desc
-					if self.is_postgres and self.is_aggregate_query:
-						self.query = self.query.orderby(
-							self._normalize_postgres_order_field(field), order=order_direction
-						)
-					else:
-						self.query = self.query.orderby(field, order=order_direction)
+					self._add_order_by(field, order_direction)
 		else:
 			field = self.table[sort_field]
 			if self.db_query_compat:
 				order_direction = Order.desc if sort_order.lower() == "desc" else Order.asc
 			else:
 				order_direction = Order.asc if sort_order.lower() == "asc" else Order.desc
-			if self.is_postgres and self.is_aggregate_query:
-				self.query = self.query.orderby(
-					self._normalize_postgres_order_field(field), order=order_direction
-				)
-			else:
-				self.query = self.query.orderby(field, order=order_direction)
+			self._add_order_by(field, order_direction)
 
 	def _parse_backtick_field_notation(self, field_name: str) -> tuple[str, str] | None:
 		"""
@@ -1903,14 +1858,11 @@ class Engine:
 		# because either of those is required to perform a query
 		return True
 
-	def build_match_conditions(self, as_condition: bool = True) -> str | list:
-		"""Build permission-based conditions for the doctype."""
+	def build_match_conditions(self, as_condition: bool = True) -> "Criterion | list | None":
+		"""Permission conditions for the doctype: a criterion (rendered by the caller where the
+		SQL is assembled), or the match filters as a list when `as_condition` is False."""
 		if as_condition:
-			condition = self.get_permission_conditions(self.doctype, self.table)
-			if condition:
-				quote_char = "`" if self.is_mariadb else '"'
-				return condition.get_sql(with_namespace=True, quote_char=quote_char)
-			return ""
+			return self.get_permission_conditions(self.doctype, self.table)
 
 		if not self.ignore_user_permissions:
 			match_filters = []
@@ -1954,6 +1906,8 @@ class Engine:
 	def build_filter_conditions(
 		self, filters, conditions: list, ignore_permissions: bool | None = None
 	) -> None:
+		"""Append one criterion per filter to `conditions`; the caller renders them where the SQL
+		is assembled."""
 		if not filters:
 			return
 
@@ -1962,20 +1916,7 @@ class Engine:
 			self.apply_permissions = not ignore_permissions
 
 		try:
-			criteria_list = []
-			self.apply_filters(filters, collect=criteria_list)
-
-			quote_char = "`" if self.is_mariadb else '"'
-			for c in criteria_list:
-				if self.is_mariadb:
-					# pypika's ValueWrapper only escapes quote characters, not backslashes.
-					# MariaDB's default sql_mode treats `\` as an escape char inside string
-					# literals, so an unescaped trailing backslash lets a filter value break
-					# out of its quotes.
-					for node in c.nodes_():
-						if isinstance(node, ValueWrapper) and isinstance(node.value, str):
-							node.value = node.value.replace("\\", "\\\\")
-				conditions.append(c.get_sql(with_namespace=True, quote_char=quote_char))
+			self.apply_filters(filters, collect=conditions)
 		finally:
 			self.apply_permissions = original_apply_permissions
 
@@ -2005,63 +1946,8 @@ class Engine:
 		return True
 
 	def _get_ifnull_fallback(self, doctype: str, fieldname: str) -> str:
-		"""Get type-appropriate fallback value for NULL comparisons."""
-		try:
-			meta = frappe.get_meta(doctype)
-			df = meta.get_field(fieldname)
-		except Exception:
-			if frappe.db.db_type == "postgres":
-				"""check type and accordingly choose fallback (to avoid postgres type cast errors)"""
-				target_table = frappe.utils.get_table_name(doctype)
-				info_schema = frappe.qb.Schema("information_schema")
-				columns = info_schema.columns
-				current_schema = frappe.conf.get("db_schema", "public")
-				res = (
-					frappe.qb.from_(columns)
-					.select(columns.data_type)
-					.where(
-						(columns.table_name == target_table)
-						& (columns.column_name == fieldname)
-						& (columns.table_schema == current_schema)
-					)
-				).run(pluck=True)
-				data_type = res[0] if res else None
-				if data_type in ("smallint", "bigint", "int", "numeric"):  # can add as needed
-					return "0"
-			return "''"
-
-		if df is None:
-			# Try to get standard field definition
-			from frappe.model.meta import get_default_df
-
-			df = get_default_df(fieldname)
-			if df is None:
-				return "''"
-
-		fieldtype = df.fieldtype
-
-		if fieldtype in ("Link", "Data", "Dynamic Link"):
-			return "''"
-
-		if fieldtype in ("Date", "Datetime"):
-			return "'0001-01-01'"
-
-		if fieldtype == "Time":
-			return "'00:00:00'"
-
-		if fieldtype in ("Float", "Int", "Currency", "Percent", "Check"):
-			return "0"
-
-		try:
-			db_type_info = frappe.db.type_map.get(fieldtype, ("varchar",))
-			if db_type_info:
-				db_type = db_type_info[0] if isinstance(db_type_info, tuple | list) else db_type_info
-				if db_type in ("varchar", "text", "longtext", "smalltext", "json"):
-					return "''"
-		except Exception:
-			pass
-
-		return "''"
+		"""Type-appropriate fallback value for NULL comparisons, as a SQL literal."""
+		return as_sql_literal(get_null_fallback(doctype, fieldname))
 
 	def _should_apply_ifnull(self, doctype: str, fieldname: str, operator: str, value: Any) -> bool:
 		"""Determine if IFNULL wrapping is needed for a filter condition."""
@@ -2143,11 +2029,9 @@ class DynamicTableField:
 		self.parent_doctype = parent_doctype
 
 	def __str__(self) -> str:
-		table_name = f"`tab{self.doctype}`"
-		fieldname = f"`{self.fieldname}`"
-		if frappe.db.db_type == "postgres":
-			table_name = table_name.replace("`", '"')
-			fieldname = fieldname.replace("`", '"')
+		quote = frappe.local.qb._BuilderClasss.QUOTE_CHAR
+		table_name = f"{quote}tab{self.doctype}{quote}"
+		fieldname = f"{quote}{self.fieldname}{quote}"
 		alias = f"AS {self.alias}" if self.alias else ""
 		return f"{table_name}.{fieldname} {alias}".strip()
 

@@ -1,6 +1,7 @@
 from datetime import datetime, time, timedelta
 from typing import Any
 
+from pypika import Dialects
 from pypika.dialects import SQLLiteValueWrapper
 from pypika.queries import QueryBuilder
 from pypika.terms import Criterion, Function, ValueWrapper
@@ -68,12 +69,22 @@ class ParameterizedValueWrapper(ValueWrapper):
 				# `WHERE ... OR '0'` (a condition), where postgres rejects a bare 1
 				self.value = str(int(self.value))
 
-			sql = self.get_value_sql(
-				quote_char=quote_char,
-				secondary_quote_char=secondary_quote_char,
-				param_wrapper=param_wrapper,
-				**kwargs,
-			)
+			if isinstance(self.value, str) and kwargs.get("dialect") is Dialects.MYSQL:
+				# MariaDB's default sql_mode treats \ inside a literal as an escape; double it
+				sql = self.get_formatted_value(
+					self.value.replace("\\", "\\\\"),
+					quote_char=quote_char,
+					secondary_quote_char=secondary_quote_char,
+					param_wrapper=param_wrapper,
+					**kwargs,
+				)
+			else:
+				sql = self.get_value_sql(
+					quote_char=quote_char,
+					secondary_quote_char=secondary_quote_char,
+					param_wrapper=param_wrapper,
+					**kwargs,
+				)
 		return format_alias_sql(sql, self.alias, quote_char=quote_char, **kwargs)
 
 

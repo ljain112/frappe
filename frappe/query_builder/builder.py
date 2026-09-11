@@ -2,7 +2,7 @@ import re
 import types
 import typing
 
-from pypika import MySQLQuery, Order, PostgreSQLQuery, SQLLiteQuery, terms
+from pypika import Dialects, MySQLQuery, Order, PostgreSQLQuery, SQLLiteQuery, terms
 from pypika.dialects import MySQLQueryBuilder, PostgreSQLQueryBuilder, SQLLiteQueryBuilder
 from pypika.queries import QueryBuilder, Schema, Table
 from pypika.terms import Function
@@ -45,6 +45,11 @@ class Base:
 	def functions(name: str, *args, **kwargs) -> Function:
 		return Function(name, *args, **kwargs)
 
+	@classmethod
+	def render(cls, term, **kwargs) -> str:
+		"""SQL text of a term for this builder's database, quoted and spelled as a query would render it."""
+		return term.get_sql(quote_char=cls._BuilderClasss.QUOTE_CHAR, dialect=cls.dialect, **kwargs)
+
 	@staticmethod
 	def DocType(table_name: str, *args, **kwargs) -> Table:
 		Base.validate_doctype(table_name)
@@ -71,15 +76,23 @@ class Base:
 			throw(_("Invalid DocType: {0}").format(doctype))
 
 
-class RecursiveCTEMixin:
-	"""Adds `WITH RECURSIVE` support to a pypika query builder. Pass `recursive=True` to
-	`frappe.qb.with_(subquery, name, recursive=True)` and reference the CTE inside its own recursive
-	term via `pypika.Table(name)`. Renders `WITH RECURSIVE` on postgres, mariadb (10.2+) and sqlite;
-	a non-recursive builder is byte-for-byte unchanged (`recursive` defaults to False)."""
+class FrappeQueryBuilderMixin:
+	"""Base of every query builder `frappe.qb` hands out.
+
+	Adds `WITH RECURSIVE` (`frappe.qb.with_(..., recursive=True)`) and compiles the tree for the
+	target database in `get_sql`, so every render path -- `str()`, `get_sql()`, `walk()`,
+	`run()` -- applies the same shape rules.
+	"""
 
 	def __init__(self, *args, recursive: bool = False, **kwargs):
 		super().__init__(*args, **kwargs)
 		self._recursive_cte = recursive
+
+	def get_sql(self, **kwargs):
+		from frappe.query_builder.utils import compile_query  # utils imports this module
+
+		compiled = compile_query(self, kwargs.get("dialect"))
+		return super(FrappeQueryBuilderMixin, compiled).get_sql(**kwargs)
 
 	def _with_sql(self, **kwargs) -> str:
 		keyword = "WITH RECURSIVE " if getattr(self, "_recursive_cte", False) else "WITH "
@@ -89,20 +102,21 @@ class RecursiveCTEMixin:
 		)
 
 
-class RecursiveMySQLQueryBuilder(RecursiveCTEMixin, MySQLQueryBuilder):
+class RecursiveMySQLQueryBuilder(FrappeQueryBuilderMixin, MySQLQueryBuilder):
 	pass
 
 
-class RecursivePostgreSQLQueryBuilder(RecursiveCTEMixin, PostgreSQLQueryBuilder):
+class RecursivePostgreSQLQueryBuilder(FrappeQueryBuilderMixin, PostgreSQLQueryBuilder):
 	pass
 
 
-class RecursiveSQLLiteQueryBuilder(RecursiveCTEMixin, SQLLiteQueryBuilder):
+class RecursiveSQLLiteQueryBuilder(FrappeQueryBuilderMixin, SQLLiteQueryBuilder):
 	pass
 
 
 class MariaDB(Base, MySQLQuery):
 	Field = terms.Field
+	dialect = Dialects.MYSQL
 
 	_BuilderClasss = RecursiveMySQLQueryBuilder
 
@@ -118,6 +132,7 @@ class MariaDB(Base, MySQLQuery):
 
 
 class Postgres(Base, PostgreSQLQuery):
+	dialect = Dialects.POSTGRESQL
 	field_translation = types.MappingProxyType({"table_name": "relname", "table_rows": "n_tup_ins"})
 	schema_translation = types.MappingProxyType({"tables": "pg_stat_all_tables"})
 	# TODO: Find a better way to do this
@@ -156,6 +171,7 @@ class Postgres(Base, PostgreSQLQuery):
 
 class SQLite(Base, SQLLiteQuery):
 	Field = terms.Field
+	dialect = Dialects.SQLLITE
 
 	_BuilderClasss = RecursiveSQLLiteQueryBuilder
 
