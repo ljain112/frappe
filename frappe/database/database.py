@@ -890,32 +890,26 @@ class Database:
 		        frappe.db.set_single_value("System Settings", "deny_multiple_sessions", True)
 		"""
 
-		versions = []
-		if check_permission or save_version:
-			versions = self._prepare_tracked_update(
-				doctype,
-				{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
-				check_permission,
-				save_version,
-				updater_reference,
+		with self._tracked_update(
+			doctype,
+			{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
+			check_permission,
+			save_version,
+			updater_reference,
+		):
+			to_update = self._get_update_dict(
+				fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
 			)
 
-		to_update = self._get_update_dict(
-			fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
-		)
+			frappe.db.delete(
+				"Singles", filters={"field": ("in", tuple(to_update)), "doctype": doctype}, debug=debug
+			)
 
-		frappe.db.delete(
-			"Singles", filters={"field": ("in", tuple(to_update)), "doctype": doctype}, debug=debug
-		)
-
-		singles_data = ((doctype, key, sbool(value)) for key, value in to_update.items())
-		frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(debug=debug)
-		frappe.clear_document_cache(doctype, doctype)
-
-		if versions:
-			from frappe.model.document import bulk_insert
-
-			bulk_insert("Version", versions)
+			singles_data = ((doctype, key, sbool(value)) for key, value in to_update.items())
+			frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(
+				debug=debug
+			)
+			frappe.clear_document_cache(doctype, doctype)
 
 	def get_single_value(
 		self,
@@ -1035,8 +1029,7 @@ class Database:
 			)
 			return
 
-		names = None
-		versions = []
+		doc_updates = {}
 		if check_permission or save_version:
 			names = (
 				[convert_to_value(dn)]
@@ -1046,40 +1039,33 @@ class Database:
 			if not names:
 				return
 
-			values = field if isinstance(field, dict) else {field: val}
-			versions = self._prepare_tracked_update(
-				dt, dict.fromkeys(names, values), check_permission, save_version, updater_reference
-			)
+			doc_updates = dict.fromkeys(names, field if isinstance(field, dict) else {field: val})
 			# write only the documents that were checked
 			dn = {"name": ("in", names)}
 
-		to_update = self._get_update_dict(
-			field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
-		)
+		with self._tracked_update(dt, doc_updates, check_permission, save_version, updater_reference):
+			to_update = self._get_update_dict(
+				field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
+			)
 
-		query = frappe.qb.get_query(
-			table=dt,
-			filters=dn,
-			update=True,
-		)
+			query = frappe.qb.get_query(
+				table=dt,
+				filters=dn,
+				update=True,
+			)
 
-		if names is not None:
-			frappe.clear_document_cache(dt, names)
-		elif isinstance(dn, FilterValue):
-			frappe.clear_document_cache(dt, convert_to_value(dn))
-		else:
-			# No way to guess which documents are modified, clear all of them
-			frappe.clear_document_cache(dt)
+			if doc_updates:
+				frappe.clear_document_cache(dt, list(doc_updates))
+			elif isinstance(dn, FilterValue):
+				frappe.clear_document_cache(dt, convert_to_value(dn))
+			else:
+				# No way to guess which documents are modified, clear all of them
+				frappe.clear_document_cache(dt)
 
-		for column, value in to_update.items():
-			query = query.set(column, value)
+			for column, value in to_update.items():
+				query = query.set(column, value)
 
-		query.run(debug=debug)
-
-		if versions:
-			from frappe.model.document import bulk_insert
-
-			bulk_insert("Version", versions)
+			query.run(debug=debug)
 
 	def bulk_update(
 		self,
@@ -1134,47 +1120,43 @@ class Database:
 		if not doc_updates:
 			return
 
-		versions = []
-		if check_permission or save_version:
-			versions = self._prepare_tracked_update(
-				doctype, doc_updates, check_permission, save_version, updater_reference
-			)
+		with self._tracked_update(doctype, doc_updates, check_permission, save_version, updater_reference):
+			modified_dict = None
+			if update_modified:
+				modified_dict = self._get_update_dict(
+					{}, None, modified=modified, modified_by=modified_by, update_modified=update_modified
+				)
 
-		modified_dict = None
-		if update_modified:
-			modified_dict = self._get_update_dict(
-				{}, None, modified=modified, modified_by=modified_by, update_modified=update_modified
-			)
+			total_docs = len(doc_updates)
+			iterator = iter(doc_updates.items())
 
-		total_docs = len(doc_updates)
-		iterator = iter(doc_updates.items())
+			for __ in range(0, total_docs, chunk_size):
+				doc_chunk = dict(itertools.islice(iterator, chunk_size))
+				self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
 
-		for __ in range(0, total_docs, chunk_size):
-			doc_chunk = dict(itertools.islice(iterator, chunk_size))
-			self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
+			frappe.clear_document_cache(doctype, list(doc_updates))
 
-		frappe.clear_document_cache(doctype, list(doc_updates))
-
-		if versions:
-			from frappe.model.document import bulk_insert
-
-			bulk_insert("Version", versions)
-
-	def _prepare_tracked_update(
+	@contextmanager
+	def _tracked_update(
 		self,
 		doctype: str,
 		doc_updates: dict,
 		check_permission: bool,
 		save_version: bool,
 		updater_reference: dict | None,
-	) -> list:
-		"""Check the user may write `doc_updates`, and return the Versions to save for them.
+	):
+		"""Around a write of `doc_updates`: check the user may make it, and record it on the timeline.
 
-		Rows of a child DocType are checked through their parent documents, as `has_permission` checks
-		them; the parents' cache is cleared and the change recorded on their timeline, as `Document.save`
-		records it.
+		`has_permission` decides, as it does for `Document.save`, and `Document._get_version` records.
+		Rows of a child DocType are checked through, and recorded on, their parent documents, which are
+		cleared from the cache.
 		"""
+		if not (check_permission or save_version):
+			yield
+			return
+
 		from frappe.model import child_table_fields, default_fields
+		from frappe.model.document import bulk_insert
 		from frappe.permissions import get_permitted_docs
 
 		meta = frappe.get_meta(doctype)
@@ -1207,14 +1189,9 @@ class Database:
 						frappe.PermissionError,
 					)
 
-			if meta.issingle:
-				denied = [] if frappe.has_permission(doctype, "write") else [doctype]
-			else:
-				# names are compared as stored (int or str), as get_permitted_docs returns them
-				permitted = {cstr(name) for name in get_permitted_docs(doctype, doc_updates, "write")}
-				denied = [name for name in doc_updates if cstr(name) not in permitted]
-
-			if denied:
+			# names are compared as stored (int or str), as get_permitted_docs returns them
+			permitted = {cstr(name) for name in get_permitted_docs(doctype, doc_updates, "write")}
+			if denied := [name for name in doc_updates if cstr(name) not in permitted]:
 				frappe.throw(
 					_("No permission for {0}").format(f"{_(doctype)} {denied[0]}"), frappe.PermissionError
 				)
@@ -1224,7 +1201,8 @@ class Database:
 			frappe.clear_document_cache(parenttype, parent_names)
 
 		if not save_version:
-			return []
+			yield
+			return
 
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
 
@@ -1275,7 +1253,11 @@ class Database:
 				version.set_new_name()
 				versions.append(version)
 
-		return versions
+		yield
+
+		# after the write, which raised instead where it failed
+		if versions:
+			bulk_insert("Version", versions)
 
 	@staticmethod
 	def _build_and_run_bulk_update_query(

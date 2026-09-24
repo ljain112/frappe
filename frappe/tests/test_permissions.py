@@ -477,6 +477,11 @@ class TestPermissions(IntegrationTestCase):
 			]
 		rows = [row.name for record in records for row in (*record.rows, *record.restricted_rows)]
 		records = [record.name for record in records]
+		# rows are shared through their parent
+		self.addCleanup(
+			frappe.share.add_docshare(parent.name, records[0], "test3@example.com", read=1).delete,
+			ignore_permissions=True,
+		)
 
 		documents = {
 			"Test Blog Post": posts,
@@ -515,33 +520,23 @@ class TestPermissions(IntegrationTestCase):
 
 		assert_same_as_has_permission()
 
-		orphan = frappe.get_doc(
-			{
-				"doctype": child.name,
-				"parent": "_Test Missing Record",
-				"parenttype": parent.name,
-				"parentfield": "rows",
-			}
-		)
-		orphan.db_insert()
-		self.assertEqual(get_permitted_docs(child.name, [orphan.name], "read", "test1@example.com"), [])
-		self.assertEqual(
-			get_permitted_docs(child.name, [orphan.name], "read", "Administrator"), [orphan.name]
-		)
-		frappe.db.delete(child.name, orphan.name)
-
-		# a row whose parentfield is not one of its parent's tables is denied, and compared from here on
-		stray = frappe.get_doc(
-			{
-				"doctype": child.name,
-				"parent": records[0],
-				"parenttype": parent.name,
-				"parentfield": "stray_rows",
-			}
-		)
-		stray.db_insert()
-		documents[child.name].append(stray.name)
-		assert_same_as_has_permission()
+		# rows that no parent document holds are missing, as they are to Document.save: an orphan,
+		# and a row whose parentfield is not one of its parent's tables
+		strays = []
+		for parent_name, parentfield in (("_Test Missing Record", "rows"), (records[0], "stray_rows")):
+			stray = frappe.get_doc(
+				{
+					"doctype": child.name,
+					"parent": parent_name,
+					"parenttype": parent.name,
+					"parentfield": parentfield,
+				}
+			)
+			stray.db_insert()
+			strays.append(stray.name)
+		for user in users:
+			self.assertEqual(get_permitted_docs(child.name, strays, "read", user), [], msg=user)
+		frappe.db.delete(child.name, {"name": ("in", strays)})
 
 		# a `has_permission` hook may read child rows, so they are read for it without User Permissions too
 		get_hooks = frappe.get_hooks
@@ -589,6 +584,11 @@ class TestPermissions(IntegrationTestCase):
 			get_permitted_docs(parent.name, records, "read", "test2@example.com"), [records[0], records[3]]
 		)
 
+		# rows reached through a share of their parent cost no query per row
+		get_permitted_docs(child.name, rows, "read", "test3@example.com")
+		with self.assertQueryCount(5):
+			get_permitted_docs(child.name, rows, "read", "test3@example.com")
+
 		with self.change_settings("System Settings", disable_document_sharing=1):
 			assert_same_as_has_permission()
 
@@ -598,14 +598,28 @@ class TestPermissions(IntegrationTestCase):
 
 	def test_get_permitted_docs_reads_documents_in_bulk(self):
 		names = frappe.get_all("Test Blog Post", pluck="name")
+
+		# without User Permissions or a hook, the child tables are not read, so not loaded
+		get_permitted_docs("Test Blog Post", names, "write", "test1@example.com")
+		with self.assertQueryCount(1):
+			self.assertEqual(get_permitted_docs("Test Blog Post", names, "write", "test1@example.com"), names)
+
 		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
 		get_permitted_docs("Test Blog Post", names, "write", "test2@example.com")
 
+		# the posts, their one child table, and the shares of those denied
 		with self.assertQueryCount(3):
 			get_permitted_docs("Test Blog Post", names, "write", "test2@example.com")
 
-		with self.assertQueryCount(1):
-			self.assertEqual(get_permitted_docs("Test Blog Post", names, "write", "Administrator"), names)
+		# however many documents only a share grants
+		for name in names:
+			self.addCleanup(
+				frappe.share.add_docshare("Test Blog Post", name, "test3@example.com", write=1).delete,
+				ignore_permissions=True,
+			)
+		get_permitted_docs("Test Blog Post", names, "write", "test3@example.com")
+		with self.assertQueryCount(3):
+			self.assertEqual(get_permitted_docs("Test Blog Post", names, "write", "test3@example.com"), names)
 
 	def test_get_permitted_docs_names_as_stored(self):
 		doctype = new_doctype(

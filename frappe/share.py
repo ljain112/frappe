@@ -15,6 +15,8 @@ from frappe.desk.form.document_follow import _follow_document
 from frappe.utils import cint
 
 if TYPE_CHECKING:
+	from collections.abc import Iterable
+
 	from frappe.model.document import Document
 
 
@@ -185,20 +187,54 @@ def get_shared(doctype, user=None, rights=None, *, filters=None, limit=None):
 	if filters:
 		share_filters += filters
 
-	or_filters = [["user", "=", user]]
-	if user != "Guest":
-		or_filters += [["everyone", "=", 1]]
-
 	shared_docs = frappe.get_all(
 		"DocShare",
 		fields=["share_name"],
 		filters=share_filters,
-		or_filters=or_filters,
+		or_filters=_shared_with(user),
 		order_by=None,
 		limit_page_length=limit,
 	)
 
 	return [doc.share_name for doc in shared_docs]
+
+
+def get_docshares(documents: "Iterable[tuple[str, str]]", user: str | None = None) -> dict[tuple, list]:
+	"""Return the DocShare rows that share the documents with the user, by `(doctype, name)`.
+
+	One query for all of them, where `get_shared` would take one each; for
+	`has_permission(..., docshares=...)`.
+	"""
+	if not user:
+		user = frappe.session.user
+
+	documents = set(documents)
+	docshares = {}
+	if not documents:
+		return docshares
+
+	for share in frappe.get_all(
+		"DocShare",
+		fields=["*"],
+		filters={
+			"share_doctype": ("in", list({doctype for doctype, __ in documents})),
+			"share_name": ("in", list({name for __, name in documents})),
+		},
+		or_filters=_shared_with(user),
+		order_by=None,
+	):
+		if (document := (share.share_doctype, share.share_name)) in documents:
+			docshares.setdefault(document, []).append(share)
+
+	return docshares
+
+
+def _shared_with(user: str) -> list:
+	"""Filters for the DocShare rows that share with `user`: to them, or to everyone but Guest."""
+	or_filters = [["user", "=", user]]
+	if user != "Guest":
+		or_filters += [["everyone", "=", 1]]
+	return or_filters
 
 
 def get_shared_doctypes(user=None):
