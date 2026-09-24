@@ -9,7 +9,7 @@ import string
 import traceback
 import warnings
 from collections.abc import Iterable, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, suppress
 from time import time
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -888,28 +888,26 @@ class Database:
 		        frappe.db.set_single_value("System Settings", "deny_multiple_sessions", True)
 		"""
 
-		with (
-			self._tracked_update(
-				doctype,
-				{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
-				updater_reference,
-			)
-			if save_version
-			else nullcontext()
-		):
-			to_update = self._get_update_dict(
-				fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
-			)
+		versions = self._prepare_versions(
+			doctype,
+			{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
+			save_version,
+			updater_reference,
+		)
 
-			frappe.db.delete(
-				"Singles", filters={"field": ("in", tuple(to_update)), "doctype": doctype}, debug=debug
-			)
+		to_update = self._get_update_dict(
+			fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
+		)
 
-			singles_data = ((doctype, key, sbool(value)) for key, value in to_update.items())
-			frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(
-				debug=debug
-			)
-			frappe.clear_document_cache(doctype, doctype)
+		frappe.db.delete(
+			"Singles", filters={"field": ("in", tuple(to_update)), "doctype": doctype}, debug=debug
+		)
+
+		singles_data = ((doctype, key, sbool(value)) for key, value in to_update.items())
+		frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(debug=debug)
+		frappe.clear_document_cache(doctype, doctype)
+
+		self._insert_versions(versions)
 
 	def get_single_value(
 		self,
@@ -1040,27 +1038,30 @@ class Database:
 				# write only the documents that are recorded
 				dn = {"name": ("in", names)}
 
-		with self._tracked_update(dt, doc_updates, updater_reference) if save_version else nullcontext():
-			to_update = self._get_update_dict(
-				field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
-			)
+		versions = self._prepare_versions(dt, doc_updates, save_version, updater_reference)
 
-			query = frappe.qb.get_query(
-				table=dt,
-				filters=dn,
-				update=True,
-			)
+		to_update = self._get_update_dict(
+			field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
+		)
 
-			if isinstance(dn, FilterValue):
-				frappe.clear_document_cache(dt, convert_to_value(dn))
-			else:
-				# No way to guess which documents are modified, clear all of them
-				frappe.clear_document_cache(dt)
+		query = frappe.qb.get_query(
+			table=dt,
+			filters=dn,
+			update=True,
+		)
 
-			for column, value in to_update.items():
-				query = query.set(column, value)
+		if isinstance(dn, FilterValue):
+			frappe.clear_document_cache(dt, convert_to_value(dn))
+		else:
+			# No way to guess which documents are modified, clear all of them
+			frappe.clear_document_cache(dt)
 
-			query.run(debug=debug)
+		for column, value in to_update.items():
+			query = query.set(column, value)
+
+		query.run(debug=debug)
+
+		self._insert_versions(versions)
 
 	def bulk_update(
 		self,
@@ -1111,28 +1112,33 @@ class Database:
 		if not doc_updates:
 			return
 
-		with self._tracked_update(doctype, doc_updates, updater_reference) if save_version else nullcontext():
-			modified_dict = None
-			if update_modified:
-				modified_dict = self._get_update_dict(
-					{}, None, modified=modified, modified_by=modified_by, update_modified=update_modified
-				)
+		versions = self._prepare_versions(doctype, doc_updates, save_version, updater_reference)
 
-			total_docs = len(doc_updates)
-			iterator = iter(doc_updates.items())
+		modified_dict = None
+		if update_modified:
+			modified_dict = self._get_update_dict(
+				{}, None, modified=modified, modified_by=modified_by, update_modified=update_modified
+			)
 
-			for __ in range(0, total_docs, chunk_size):
-				doc_chunk = dict(itertools.islice(iterator, chunk_size))
-				self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
+		total_docs = len(doc_updates)
+		iterator = iter(doc_updates.items())
 
-	@contextmanager
-	def _tracked_update(self, doctype: str, doc_updates: dict, updater_reference: dict | None):
-		"""Around a write of `doc_updates`: record it on the timeline, as `Document.save` does.
+		for __ in range(0, total_docs, chunk_size):
+			doc_chunk = dict(itertools.islice(iterator, chunk_size))
+			self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
 
-		`Document._get_version` records the change. Rows of a child DocType are recorded on their parent
-		documents.
+		self._insert_versions(versions)
+
+	def _prepare_versions(
+		self, doctype: str, doc_updates: dict, save_version: bool, updater_reference: dict | None
+	) -> list:
+		"""Return the Versions that record `doc_updates` on the timeline, as `Document.save` does.
+
+		Call before the write, which changes the values read here; insert them after it. Rows of a child
+		DocType are recorded on their parent documents.
 		"""
-		from frappe.model.document import bulk_insert
+		if not save_version:
+			return []
 
 		meta = frappe.get_meta(doctype)
 		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
@@ -1198,10 +1204,14 @@ class Database:
 				version.set_new_name()
 				versions.append(version)
 
-		yield
+		return versions
 
-		# after the write, which raised instead where it failed
+	@staticmethod
+	def _insert_versions(versions: list):
+		"""Insert the Versions from `_prepare_versions`, after the write they record."""
 		if versions:
+			from frappe.model.document import bulk_insert
+
 			bulk_insert("Version", versions)
 
 	@staticmethod

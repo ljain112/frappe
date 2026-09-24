@@ -2004,10 +2004,11 @@ class TestDBSetValue(IntegrationTestCase):
 				sidebars[2].sidebar_items[0].name: {"title": "a2"},
 			},
 			save_version=True,
+			updater_reference={"label": "via test"},
 		)
 
-		row_changed = {
-			docname: frappe.parse_json(data)["row_changed"]
+		versions = {
+			docname: frappe.parse_json(data)
 			for docname, data in frappe.get_all(
 				"Version",
 				filters={"ref_doctype": "Website Sidebar", "docname": ("in", [s.name for s in sidebars])},
@@ -2015,6 +2016,7 @@ class TestDBSetValue(IntegrationTestCase):
 				as_list=True,
 			)
 		}
+		row_changed = {docname: version["row_changed"] for docname, version in versions.items()}
 		self.assertEqual(
 			row_changed[sidebars[1].name],
 			[
@@ -2026,6 +2028,7 @@ class TestDBSetValue(IntegrationTestCase):
 			row_changed[sidebars[2].name],
 			[["sidebar_items", 0, sidebars[2].sidebar_items[0].name, [["title", "a", "a2"]]]],
 		)
+		self.assertEqual(versions[sidebars[2].name]["updater_reference"], {"label": "via test"})
 
 		# rows of two tables of one child DocType, on one Version
 		workspace = frappe.get_doc(
@@ -2052,6 +2055,79 @@ class TestDBSetValue(IntegrationTestCase):
 				["removed_roles", 0, workspace.removed_roles[0].name, [["role", "Guest", "System Manager"]]],
 			],
 		)
+
+	def test_bulk_update_saves_a_version_each(self):
+		todos = [
+			frappe.get_doc(
+				doctype="ToDo", description="test_bulk_update_saves_version", priority="Low"
+			).insert()
+			for _ in range(2)
+		]
+
+		frappe.db.bulk_update(
+			"ToDo",
+			{todos[0].name: {"priority": "High"}, todos[1].name: {"status": "Closed"}},
+			save_version=True,
+			updater_reference={"label": "via test"},
+		)
+
+		for todo, changed in zip(
+			todos, ([["priority", "Low", "High"]], [["status", "Open", "Closed"]]), strict=True
+		):
+			data = frappe.parse_json(
+				frappe.db.get_value("Version", {"ref_doctype": "ToDo", "docname": todo.name}, "data")
+			)
+			self.assertEqual(data["changed"], changed)
+			self.assertEqual(data["updater_reference"], {"label": "via test"})
+			self.assertEqual(frappe.get_cached_doc("ToDo", todo.name).get(changed[0][0]), changed[0][2])
+
+	def test_set_value_records_a_currency_field_in_the_document_currency(self):
+		from frappe.core.doctype.doctype.test_doctype import new_doctype
+		from frappe.utils import fmt_money
+
+		doctype = new_doctype(
+			fields=[
+				{"fieldname": "currency", "fieldtype": "Link", "options": "Currency"},
+				{"fieldname": "amount", "fieldtype": "Currency", "options": "currency"},
+			],
+			track_changes=1,
+		).insert()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "tab{doctype.name}" CASCADE')
+		self.addCleanup(doctype.delete)
+		docs = [frappe.get_doc(doctype=doctype.name, currency="USD", amount=100).insert() for _ in range(2)]
+
+		# the same change as Document.save records it
+		docs[0].amount = 50
+		docs[0].save(ignore_version=False)
+		frappe.db.set_value(doctype.name, docs[1].name, "amount", 50, save_version=True)
+
+		changed = [
+			frappe.parse_json(
+				frappe.db.get_value("Version", {"ref_doctype": doctype.name, "docname": doc.name}, "data")
+			)["changed"]
+			for doc in docs
+		]
+		self.assertEqual(
+			changed[0], [["amount", fmt_money(100, currency="USD"), fmt_money(50, currency="USD")]]
+		)
+		self.assertEqual(changed[1], changed[0])
+
+	def test_set_value_on_an_untracked_doctype_records_nothing(self):
+		from frappe.core.doctype.doctype.test_doctype import new_doctype
+
+		doctype = new_doctype().insert()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "tab{doctype.name}" CASCADE')
+		self.addCleanup(doctype.delete)
+		doc = frappe.get_doc(doctype=doctype.name, some_fieldname="a").insert()
+		frappe.get_meta(doctype.name)
+
+		# only the write, as without the flag
+		with self.assertQueryCount(1):
+			frappe.db.set_value(doctype.name, doc.name, "some_fieldname", "b", save_version=True)
+
+		self.assertFalse(frappe.db.exists("Version", {"ref_doctype": doctype.name, "docname": doc.name}))
 
 	def test_cleared_cache(self):
 		self.todo2.reload()
