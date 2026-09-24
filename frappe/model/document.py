@@ -1962,7 +1962,17 @@ class Document(BaseDocument):
 			data = {"doctype": self.doctype, "name": self.name, "user": frappe.session.user}
 			frappe.publish_realtime("list_update", data, after_commit=True)
 
-	def db_set(self, fieldname, value=None, update_modified=True, notify=False, commit=False):
+	def db_set(
+		self,
+		fieldname,
+		value=None,
+		update_modified=True,
+		notify=False,
+		commit=False,
+		*,
+		save_version: bool = False,
+		updater_reference: dict | None = None,
+	):
 		"""Set a value in the document object, update the timestamp and update the database.
 
 		WARNING: This method does not trigger controller validations and should
@@ -1973,6 +1983,9 @@ class Document(BaseDocument):
 		:param update_modified: default True. updates the `modified` and `modified_by` properties
 		:param notify: default False. run doc.notify_update() to send updates via socketio
 		:param commit: default False. run frappe.db.commit()
+		:param save_version: Record the change on the timeline, as `frappe.db.set_value` does. Within the
+		        save of this document (or of the parent of this row), the save records it instead.
+		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 		"""
 		if isinstance(fieldname, dict):
 			self.update(fieldname)
@@ -1995,6 +2008,10 @@ class Document(BaseDocument):
 		if self.name is None:
 			return
 
+		# the Version that the save of this document records holds this change too
+		saving = (self.parenttype, self.parent) if self.meta.istable else (self.doctype, self.name)
+		save_version = save_version and saving not in frappe.flags.currently_saving
+
 		if self.meta.issingle:
 			frappe.db.set_single_value(
 				self.doctype,
@@ -2003,6 +2020,8 @@ class Document(BaseDocument):
 				modified=self.modified,
 				modified_by=self.modified_by,
 				update_modified=update_modified,
+				save_version=save_version,
+				updater_reference=updater_reference,
 			)
 		else:
 			frappe.db.set_value(
@@ -2013,6 +2032,8 @@ class Document(BaseDocument):
 				self.modified,
 				self.modified_by,
 				update_modified=update_modified,
+				save_version=save_version,
+				updater_reference=updater_reference,
 			)
 
 		self.run_method("on_change")

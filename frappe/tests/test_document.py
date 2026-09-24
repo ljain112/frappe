@@ -629,6 +629,93 @@ class TestDocument(IntegrationTestCase):
 		changed_val = frappe.db.get_single_value(c.doctype, key)
 		self.assertEqual(val, changed_val)
 
+	def test_db_set_saves_version(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test_db_set_saves_version", priority="Low"
+		).insert()
+
+		todo.db_set("priority", "High", save_version=True, updater_reference={"label": "via test"})
+		todo.db_set("priority", "High", save_version=True)  # unchanged, nothing to record
+		todo.db_set("description", "not recorded")
+
+		versions = frappe.get_all("Version", {"ref_doctype": "ToDo", "docname": todo.name}, pluck="data")
+		self.assertEqual(len(versions), 1)
+		self.assertEqual(frappe.parse_json(versions[0])["changed"], [["priority", "Low", "High"]])
+		self.assertEqual(frappe.parse_json(versions[0])["updater_reference"], {"label": "via test"})
+
+	def test_db_set_on_a_row_saves_version_on_its_parent(self):
+		sidebar = frappe.get_doc(
+			doctype="Website Sidebar",
+			title="test_db_set_on_a_row",
+			sidebar_items=[{"title": "a"}, {"title": "b"}],
+		).insert()
+
+		sidebar.sidebar_items[1].db_set("title", "b2", save_version=True)
+
+		data = frappe.db.get_value(
+			"Version", {"ref_doctype": "Website Sidebar", "docname": sidebar.name}, "data"
+		)
+		self.assertEqual(
+			frappe.parse_json(data)["row_changed"],
+			[["sidebar_items", 1, sidebar.sidebar_items[1].name, [["title", "b", "b2"]]]],
+		)
+
+	def test_db_set_singles_saves_version(self):
+		# a fresh value: this class commits (its DocTypes are created with DDL), so a fixed one may already be set
+		value = f"test_db_set_singles_saves_version {frappe.generate_hash(length=8)}"
+		frappe.get_doc("Website Settings").db_set("title_prefix", value, save_version=True)
+
+		data = frappe.db.get_value(
+			"Version",
+			{"ref_doctype": "Website Settings", "docname": "Website Settings"},
+			"data",
+			order_by="creation desc",
+		)
+		self.assertEqual(frappe.parse_json(data)["changed"][0][::2], ["title_prefix", value])
+
+	def test_db_set_within_its_own_save_is_recorded_by_the_save(self):
+		todo = frappe.get_doc(doctype="ToDo", description="test_db_set_within_save", priority="Low").insert()
+		on_update = ToDo.on_update
+
+		def on_update_and_db_set(doc):
+			on_update(doc)
+			doc.db_set("description", "set in on_update", save_version=True)
+
+		todo.priority = "High"
+		with patch.object(ToDo, "on_update", on_update_and_db_set):
+			todo.save(ignore_version=False)
+
+		versions = frappe.get_all("Version", {"ref_doctype": "ToDo", "docname": todo.name}, pluck="data")
+		self.assertEqual(len(versions), 1)
+		changed = {change[0]: change[1:] for change in frappe.parse_json(versions[0])["changed"]}
+		self.assertEqual(changed["priority"], ["Low", "High"])
+		self.assertEqual(changed["description"], ["test_db_set_within_save", "set in on_update"])
+
+	def test_db_set_on_a_row_within_its_parent_save_is_recorded_by_the_save(self):
+		from frappe.website.doctype.website_sidebar.website_sidebar import WebsiteSidebar
+
+		sidebar = frappe.get_doc(
+			doctype="Website Sidebar",
+			title="test_db_set_on_a_row_within_save",
+			sidebar_items=[{"title": "a"}, {"title": "b"}],
+		).insert()
+
+		def on_update(doc):
+			doc.sidebar_items[0].db_set("title", "a2", save_version=True)
+
+		sidebar.sidebar_items[1].title = "b2"
+		with patch.object(WebsiteSidebar, "on_update", on_update, create=True):
+			sidebar.save(ignore_version=False)
+
+		versions = frappe.get_all(
+			"Version", {"ref_doctype": "Website Sidebar", "docname": sidebar.name}, pluck="data"
+		)
+		self.assertEqual(len(versions), 1)
+		self.assertEqual(
+			[(idx, changed) for __, idx, __, changed in frappe.parse_json(versions[0])["row_changed"]],
+			[(0, [["title", "a", "a2"]]), (1, [["title", "b", "b2"]])],
+		)
+
 	def test_non_submittable_doctype_docstatus_transition(self):
 		doc = frappe.get_doc({"doctype": "ToDo", "description": "test submit guard"}).insert()
 		doc.docstatus = 1
