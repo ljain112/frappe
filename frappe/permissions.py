@@ -2,7 +2,6 @@
 # License: MIT. See LICENSE
 import copy
 import functools
-from collections.abc import Iterable
 
 import frappe
 import frappe.share
@@ -90,7 +89,6 @@ def has_permission(
 	print_logs=True,
 	debug=False,
 	ignore_share_permissions=False,
-	docshares: dict | None = None,
 ) -> bool:
 	"""Return True if user has permission `ptype` for given `doctype`.
 	If `doc` is passed, also check user, share and owner permissions.
@@ -103,9 +101,6 @@ def has_permission(
 	                which explains why the permission check failed.
 	:param parent_doctype:
 	        Required when checking permission for a child DocType (unless doc is specified)
-	:param docshares: The DocShare rows of `doc` (for a child DocType, of its parent) by `(doctype, name)`,
-	        as `frappe.share.get_docshares` returns them for many documents at once. A document it does not
-	        hold is not shared with the user.
 	"""
 
 	if not user:
@@ -133,8 +128,6 @@ def has_permission(
 			parent_doctype,
 			debug=debug,
 			print_logs=print_logs,
-			ignore_share_permissions=ignore_share_permissions,
-			docshares=docshares,
 		)
 
 	meta = frappe.get_meta(doctype)
@@ -200,20 +193,13 @@ def has_permission(
 
 		if doc:
 			doc_name = get_doc_name(doc)
-			if docshares is not None:
-				shared = [
-					share
-					for share in docshares.get((doctype, doc_name), ())
-					if all(share.get(right) for right in rights)
-				]
-			else:
-				shared = frappe.share.get_shared(
-					doctype,
-					user,
-					rights=rights,
-					filters=[["share_name", "=", doc_name]],
-					limit=1,
-				)
+			shared = frappe.share.get_shared(
+				doctype,
+				user,
+				rights=rights,
+				filters=[["share_name", "=", doc_name]],
+				limit=1,
+			)
 			debug and _debug_log(f"Document is shared with user for {ptype}? {bool(shared)}")
 			return bool(shared)
 
@@ -240,70 +226,9 @@ def has_permission(
 			print_logs=print_logs,
 			debug=debug,
 			ignore_share_permissions=ignore_share_permissions,
-			docshares=docshares,
 		)
 
 	return bool(perm)
-
-
-def get_permitted_docs(
-	doctype: str,
-	docs: Iterable,
-	ptype: str = "read",
-	user: str | None = None,
-) -> list[str | int]:
-	"""Return the names of the documents that the user has `ptype` permission on, in the order given.
-
-	Asks `has_permission` about each document, as it is asked about one, with the reads batched:
-	documents given by name are loaded with `get_docs_by_name`, and the shares of those it denies
-	are looked up at once and handed to it. Missing documents are left out, as `frappe.get_list`
-	leaves them out.
-
-	Child tables are loaded in bulk where User Permissions or a `has_permission` hook may read them,
-	and elsewhere lazily; a read that was not expected loads them, one document at a time.
-
-	:param doctype: DocType of the documents.
-	:param docs: Names of the documents, or the documents as `get_docs_by_name` loads them.
-	:param ptype: Permission type to check. Default: `read`.
-	:param user: [optional] Check for given user. Default: current user.
-	"""
-	from frappe.core.doctype.user_permission.user_permission import get_user_permissions
-	from frappe.model.base_document import BaseDocument
-	from frappe.model.document import get_docs_by_name
-
-	if not user:
-		user = frappe.session.user
-
-	docs = list(docs)
-	if docs and not isinstance(docs[0], BaseDocument):
-		# child rows are read by User Permissions, and may be by hooks: load them in bulk for those,
-		# and otherwise only if they are read, as has_permission loads a document by name
-		hooks = frappe.get_hooks("has_permission")
-		lazy = not (get_user_permissions(user) or hooks.get(doctype) or hooks.get("*"))
-		docs = list(get_docs_by_name(doctype, docs, lazy=lazy).values())
-
-	# a row of a child DocType is shared through its parent
-	istable = frappe.get_meta(doctype).istable
-	shared_as = [(doc.parenttype, cstr(doc.parent)) if istable else (doctype, cstr(doc.name)) for doc in docs]
-
-	permitted = [
-		has_permission(doctype, ptype, doc=doc, user=user, print_logs=False, ignore_share_permissions=True)
-		for doc in docs
-	]
-	if not all(permitted):
-		docshares = frappe.share.get_docshares(
-			[document for document, allowed in zip(shared_as, permitted, strict=True) if not allowed], user
-		)
-		permitted = [
-			allowed
-			or (
-				document in docshares
-				and has_permission(doctype, ptype, doc=doc, user=user, print_logs=False, docshares=docshares)
-			)
-			for doc, document, allowed in zip(docs, shared_as, permitted, strict=True)
-		]
-
-	return [doc.name for doc, allowed in zip(docs, permitted, strict=True) if allowed]
 
 
 def get_doc_permissions(doc, user=None, ptype=None, debug=False):
@@ -903,8 +828,6 @@ def has_child_permission(
 	*,
 	debug=False,
 	print_logs=True,
-	ignore_share_permissions=False,
-	docshares=None,
 ) -> bool:
 	debug and _debug_log("This doctype is a child table, permissions will be checked on parent.")
 	if isinstance(child_doc, str):
@@ -990,8 +913,6 @@ def has_child_permission(
 		user=user,
 		print_logs=print_logs,
 		debug=debug,
-		ignore_share_permissions=ignore_share_permissions,
-		docshares=docshares,
 	)
 
 

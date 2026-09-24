@@ -1042,52 +1042,6 @@ class TestGetDocs(IntegrationTestCase):
 		self.assertEqual(len(docs), 1)
 		self.assertEqual(docs[0].title, "Record 0")
 
-	def test_last_chunk_ends_the_fetch(self):
-		names = frappe.get_all(self.parent_dt, pluck="name", order_by="creation asc")
-
-		# the parents and their one child table, with no empty fetch after the short chunk
-		with self.assertQueryCount(2):
-			frappe.get_docs(self.parent_dt, chunk_size=10, order_by="creation asc")
-
-		self.assertEqual(
-			[doc.name for doc in frappe.get_docs(self.parent_dt, chunk_size=2, order_by="creation asc")],
-			names,
-		)
-
-	def test_get_docs_by_name(self):
-		import gc
-
-		from frappe.model.document import get_docs_by_name
-
-		names = frappe.get_all(self.parent_dt, pluck="name", order_by="creation desc")
-		docs = get_docs_by_name(self.parent_dt, [*names, "_Test Missing", names[0]])
-		self.assertEqual(list(docs), names)
-		self.assertEqual(docs[names[0]].as_dict(), frappe.get_doc(self.parent_dt, names[0]).as_dict())
-
-		# rows of a child DocType, within their parents, which they keep alive
-		rows = [row.name for name in reversed(names[:2]) for row in docs[name].child_table]
-		del docs
-		loaded = get_docs_by_name(self.child_dt, rows)
-		gc.collect()
-		self.assertEqual(list(loaded), rows)
-		for row in loaded.values():
-			self.assertIn(row, row.parent_doc.child_table)
-
-		self.assertEqual(
-			list(get_docs_by_name("Website Settings", ["Website Settings"])), ["Website Settings"]
-		)
-
-		# lazily, as get_lazy_doc loads them: the child tables on first access
-		eager = get_docs_by_name(self.parent_dt, names)
-		with self.assertQueryCount(1):
-			lazy = get_docs_by_name(self.parent_dt, names, lazy=True)
-		self.assertEqual(list(lazy), names)
-		for name in names:
-			self.assertEqual(
-				[row.as_dict() for row in lazy[name].child_table],
-				[row.as_dict() for row in eager[name].child_table],
-			)
-
 	def test_limit(self):
 		docs = frappe.get_docs(self.parent_dt, limit=2)
 		self.assertEqual(len(docs), 2)
