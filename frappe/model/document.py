@@ -2800,20 +2800,12 @@ def get_document_cache_key(doctype: str, name: str):
 	return f"document_cache::{doctype}::{name}"
 
 
-def clear_document_cache(doctype: str, name: str | int | Iterable[str | int] | None = None) -> None:
-	"""Clear the cached document(s): one, the given names in one round trip, or all of the DocType."""
+def clear_document_cache(doctype: str, name: str | None = None) -> None:
 	frappe.db.value_cache.pop(doctype, None)
 
-	if name is None:
-		keys = None
-	elif isinstance(name, str | int):
-		keys = get_document_cache_key(doctype, name)
-	else:
-		keys = [get_document_cache_key(doctype, n) for n in name]
-
 	def clear_in_redis():
-		if keys is not None:
-			frappe.cache.delete_value(keys)
+		if name is not None:
+			frappe.cache.delete_value(get_document_cache_key(doctype, name))
 		else:
 			frappe.cache.delete_keys(get_document_cache_key(doctype, ""))
 

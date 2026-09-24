@@ -1993,8 +1993,6 @@ class TestDBSetValue(IntegrationTestCase):
 			).insert()
 			for i in range(3)
 		]
-		frappe.get_cached_doc("Website Sidebar", sidebars[1].name)
-
 		# the same change as Document.save records it (which skips Versions in tests unless asked)
 		sidebars[0].sidebar_items[1].title = "b2"
 		sidebars[0].save(ignore_version=False)
@@ -2027,9 +2025,6 @@ class TestDBSetValue(IntegrationTestCase):
 		self.assertEqual(
 			row_changed[sidebars[2].name],
 			[["sidebar_items", 0, sidebars[2].sidebar_items[0].name, [["title", "a", "a2"]]]],
-		)
-		self.assertEqual(
-			frappe.get_cached_doc("Website Sidebar", sidebars[1].name).sidebar_items[1].title, "b2"
 		)
 
 		# rows of two tables of one child DocType, on one Version

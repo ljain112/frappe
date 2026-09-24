@@ -1036,8 +1036,9 @@ class Database:
 				return
 
 			doc_updates = dict.fromkeys(names, field if isinstance(field, dict) else {field: val})
-			# write only the documents that are recorded
-			dn = {"name": ("in", names)}
+			if not isinstance(dn, FilterValue):
+				# write only the documents that are recorded
+				dn = {"name": ("in", names)}
 
 		with self._tracked_update(dt, doc_updates, updater_reference) if save_version else nullcontext():
 			to_update = self._get_update_dict(
@@ -1050,9 +1051,7 @@ class Database:
 				update=True,
 			)
 
-			if doc_updates:
-				frappe.clear_document_cache(dt, list(doc_updates))
-			elif isinstance(dn, FilterValue):
+			if isinstance(dn, FilterValue):
 				frappe.clear_document_cache(dt, convert_to_value(dn))
 			else:
 				# No way to guess which documents are modified, clear all of them
@@ -1126,14 +1125,12 @@ class Database:
 				doc_chunk = dict(itertools.islice(iterator, chunk_size))
 				self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
 
-			frappe.clear_document_cache(doctype, list(doc_updates))
-
 	@contextmanager
 	def _tracked_update(self, doctype: str, doc_updates: dict, updater_reference: dict | None):
 		"""Around a write of `doc_updates`: record it on the timeline, as `Document.save` does.
 
 		`Document._get_version` records the change. Rows of a child DocType are recorded on their parent
-		documents, which are cleared from the cache.
+		documents.
 		"""
 		from frappe.model.document import bulk_insert
 
@@ -1147,10 +1144,6 @@ class Database:
 				doctype, filters={"name": ("in", list(doc_updates))}, fields=["parent", "parenttype"]
 			):
 				parents.setdefault(row.parenttype, set()).add(row.parent)
-
-		# a cached document holds its rows
-		for parenttype, parent_names in parents.items():
-			frappe.clear_document_cache(parenttype, parent_names)
 
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
 
