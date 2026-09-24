@@ -2,6 +2,8 @@
 # License: MIT. See LICENSE
 """Use blog post test to test user permissions logic"""
 
+from unittest.mock import patch
+
 import frappe
 import frappe.defaults
 import frappe.model.meta
@@ -21,6 +23,7 @@ from frappe.permissions import (
 	clear_user_permissions_for_doctype,
 	get_doc_permissions,
 	get_doctypes_with_read,
+	get_permitted_docs,
 	remove_user_permission,
 	update_permission_property,
 )
@@ -31,6 +34,11 @@ from frappe.utils.data import now_datetime
 from frappe.utils.user import UserPermissions
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User", "Contact", "Salutation"]
+
+
+def has_rows(doc, ptype=None, user=None):
+	"""`has_permission` hook for a test DocType: deny documents without child rows."""
+	return bool(doc.get("rows"))
 
 
 class TestPermissions(IntegrationTestCase):
@@ -401,6 +409,169 @@ class TestPermissions(IntegrationTestCase):
 		self.assertTrue(doc.has_permission("read"))
 
 		frappe.clear_cache(doctype="Test Blog Post")
+
+	def test_get_permitted_docs_answers_as_has_permission(self):
+		users = ("Administrator", "test1@example.com", "test2@example.com", "test3@example.com")
+		posts = [*frappe.get_all("Test Blog Post", pluck="name", order_by="name"), "_Test Missing Blog Post"]
+		for share in (
+			frappe.share.add_docshare("Test Blog Post", "_Test Blog Post", "test3@example.com", read=1),
+			frappe.share.add_docshare(
+				"Test Blog Post", "_Test Blog Post 1", "test3@example.com", write=1, share=1
+			),
+			frappe.share.add_docshare("Test Blog Post", "_Test Blog Post 2", everyone=1),
+		):
+			self.addCleanup(share.delete, ignore_permissions=True)
+
+		# ToDo has a `has_permission` hook: only owners and assignees, unless a share grants it
+		todos = []
+		for user in users[1:]:
+			with self.set_user(user):
+				todos.append(
+					frappe.get_doc(doctype="ToDo", description="test_get_permitted_docs").insert().name
+				)
+			self.addCleanup(frappe.delete_doc, "ToDo", todos[-1], force=True, ignore_permissions=True)
+		frappe.share.add_docshare("ToDo", todos[0], "test2@example.com", read=1)
+
+		# User Permissions apply to the links of child rows too, which are read in bulk
+		child = new_doctype(
+			istable=1,
+			fields=[
+				{
+					"label": "Category",
+					"fieldname": "category",
+					"fieldtype": "Link",
+					"options": "Test Blog Category",
+				}
+			],
+		)
+		child.insert()
+		self.addCleanup(child.delete)
+		parent = new_doctype(
+			fields=[{"label": "Rows", "fieldname": "rows", "fieldtype": "Table", "options": child.name}],
+			permissions=[{"role": "Blogger", "read": 1, "write": 1}, {"role": "System Manager", "read": 1}],
+		)
+		parent.insert()
+		self.addCleanup(parent.delete)
+		records = [
+			frappe.get_doc({"doctype": parent.name, "rows": rows}).insert().name
+			for rows in (
+				[{"category": "_Test Blog Category 1"}],
+				[{"category": "_Test Blog Category 1"}, {"category": "_Test Blog Category"}],
+				[{}],
+				[],
+			)
+		]
+
+		documents = {
+			"Test Blog Post": posts,
+			"ToDo": [*todos, "_Test Missing ToDo"],
+			parent.name: [*records, "_Test Missing Record"],
+		}
+
+		def assert_same_as_has_permission():
+			for doctype, names in documents.items():
+				for user in users:
+					for ptype in (
+						"select",
+						"read",
+						"write",
+						"create",
+						"submit",
+						"delete",
+						"share",
+						"print",
+						"email",
+						"export",
+					):
+						expected = [
+							name
+							for name in names
+							if frappe.db.exists(doctype, name)
+							and frappe.has_permission(doctype, ptype, doc=name, user=user)
+						]
+						self.assertEqual(
+							get_permitted_docs(doctype, names, ptype, user),
+							expected,
+							msg=(doctype, user, ptype),
+						)
+
+		assert_same_as_has_permission()
+
+		# a `has_permission` hook may read child rows, so they are read for it without User Permissions too
+		get_hooks = frappe.get_hooks
+		with patch(
+			"frappe.get_hooks",
+			lambda hook=None, *args, **kwargs: (
+				{
+					**get_hooks("has_permission"),
+					parent.name: [f"{__name__}.has_rows"],
+				}
+				if hook == "has_permission"
+				else get_hooks(hook, *args, **kwargs)
+			),
+		):
+			assert_same_as_has_permission()
+			self.assertEqual(
+				get_permitted_docs(parent.name, records, "read", "test2@example.com"), records[:3]
+			)
+
+		self.assertEqual(
+			get_permitted_docs("Test Blog Post", posts, "read", "test3@example.com"),
+			["_Test Blog Post", "_Test Blog Post 1", "_Test Blog Post 2"],
+		)
+		self.assertEqual(
+			get_permitted_docs("Test Blog Post", posts, "write", "test3@example.com"), ["_Test Blog Post 1"]
+		)
+		self.assertEqual(get_permitted_docs("ToDo", todos, "read", "test2@example.com"), todos[:2])
+
+		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
+		assert_same_as_has_permission()
+		self.assertEqual(
+			get_permitted_docs(parent.name, records, "read", "test2@example.com"), [records[0], *records[2:]]
+		)
+
+		self.if_owner_setup()
+		assert_same_as_has_permission()
+		self.assertEqual(
+			get_permitted_docs("Test Blog Post", posts, "read", "test2@example.com"), ["_Test Blog Post 2"]
+		)
+
+		self.set_strict_user_permissions(1)
+		self.addCleanup(self.set_strict_user_permissions, 0)
+		assert_same_as_has_permission()
+		self.assertEqual(
+			get_permitted_docs(parent.name, records, "read", "test2@example.com"), [records[0], records[3]]
+		)
+
+		with self.change_settings("System Settings", disable_document_sharing=1):
+			assert_same_as_has_permission()
+
+		# a disabled app's module denies everything but Administrator, shares included
+		with patch("frappe.permissions.is_module_disabled", return_value=True):
+			assert_same_as_has_permission()
+
+	def test_get_permitted_docs_reads_documents_in_bulk(self):
+		names = frappe.get_all("Test Blog Post", pluck="name")
+		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
+		get_permitted_docs("Test Blog Post", names, "write", "test2@example.com")
+
+		with self.assertQueryCount(3):
+			get_permitted_docs("Test Blog Post", names, "write", "test2@example.com")
+
+		with self.assertQueryCount(1):
+			self.assertEqual(get_permitted_docs("Test Blog Post", names, "write", "Administrator"), names)
+
+	def test_get_permitted_docs_names_as_stored(self):
+		doctype = new_doctype(
+			autoname="field:some_fieldname", permissions=[{"role": "System Manager", "read": 1}]
+		)
+		doctype.insert()
+		self.addCleanup(doctype.delete)
+		frappe.get_doc({"doctype": doctype.name, "some_fieldname": "123"}).insert()
+
+		for user in ("Administrator", "test1@example.com"):
+			self.assertTrue(frappe.has_permission(doctype.name, "read", doc=123, user=user))
+			self.assertEqual(get_permitted_docs(doctype.name, [123, "123"], "read", user), ["123"])
 
 	def if_owner_setup(self):
 		update("Test Blog Post", "Blogger", 0, "if_owner", 1)

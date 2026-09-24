@@ -2037,6 +2037,11 @@ class Document(BaseDocument):
 
 	def save_version(self):
 		"""Save version info"""
+		if version := self._get_version():
+			version.insert(ignore_permissions=True)
+
+	def _get_version(self) -> "Document | None":
+		"""Return the unsaved Version that records this change, or None where none is due."""
 
 		# don't track version under following conditions
 		if (
@@ -2046,19 +2051,20 @@ class Document(BaseDocument):
 			or frappe.flags.in_install
 			or (not self._doc_before_save and frappe.flags.in_patch)
 		):
-			return
+			return None
 
 		doc_to_compare = self._doc_before_save
 		if not doc_to_compare and (amended_from := self.get("amended_from")):
 			doc_to_compare = frappe.get_doc(self.doctype, amended_from)
 
-		version = frappe.new_doc("Version")
-
 		if not doc_to_compare and not self.flags.updater_reference:
-			return
+			return None
 
+		version = frappe.new_doc("Version")
 		if version.update_version_info(doc_to_compare, self):
-			version.insert(ignore_permissions=True)
+			return version
+
+		return None
 
 	@staticmethod
 	def hook(f):
@@ -2769,12 +2775,20 @@ def get_document_cache_key(doctype: str, name: str):
 	return f"document_cache::{doctype}::{name}"
 
 
-def clear_document_cache(doctype: str, name: str | None = None) -> None:
+def clear_document_cache(doctype: str, name: str | int | Iterable[str | int] | None = None) -> None:
+	"""Clear the cached document(s): one, the given names in one round trip, or all of the DocType."""
 	frappe.db.value_cache.pop(doctype, None)
 
+	if name is None:
+		keys = None
+	elif isinstance(name, str | int):
+		keys = get_document_cache_key(doctype, name)
+	else:
+		keys = [get_document_cache_key(doctype, n) for n in name]
+
 	def clear_in_redis():
-		if name is not None:
-			frappe.cache.delete_value(get_document_cache_key(doctype, name))
+		if keys is not None:
+			frappe.cache.delete_value(keys)
 		else:
 			frappe.cache.delete_keys(get_document_cache_key(doctype, ""))
 

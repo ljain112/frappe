@@ -1934,6 +1934,131 @@ class TestDBSetValue(IntegrationTestCase):
 		frappe.db.set_value("User", "Administrator", "mute_sounds", False)
 		self.assertEqual(frappe.db.get_value("User", "Administrator", "mute_sounds"), 0)
 
+	def test_set_value_saves_version(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test_set_value_saves_version", priority="Low"
+		).insert()
+
+		frappe.db.set_value(
+			"ToDo", todo.name, "priority", "High", save_version=True, updater_reference={"label": "via test"}
+		)
+		frappe.db.set_value("ToDo", todo.name, "priority", "High", save_version=True)
+
+		versions = frappe.get_all("Version", {"ref_doctype": "ToDo", "docname": todo.name}, pluck="data")
+		self.assertEqual(len(versions), 1)
+		self.assertEqual(frappe.parse_json(versions[0])["changed"], [["priority", "Low", "High"]])
+		self.assertEqual(frappe.parse_json(versions[0])["updater_reference"], {"label": "via test"})
+		self.assertEqual(frappe.get_cached_doc("ToDo", todo.name).priority, "High")
+
+	def test_set_value_by_filters_saves_a_version_each(self):
+		todos = [
+			frappe.get_doc(doctype="ToDo", description="test_set_value_by_filters", priority="Low").insert()
+			for _ in range(2)
+		]
+
+		frappe.db.set_value(
+			"ToDo", {"description": "test_set_value_by_filters"}, "priority", "High", save_version=True
+		)
+
+		for todo in todos:
+			data = frappe.db.get_value("Version", {"ref_doctype": "ToDo", "docname": todo.name}, "data")
+			self.assertEqual(frappe.parse_json(data)["changed"], [["priority", "Low", "High"]])
+
+	def test_set_value_checks_permission(self):
+		other = frappe.get_doc(doctype="ToDo", description="test_set_value_checks_permission").insert()
+		user = frappe.get_doc(
+			doctype="User",
+			email="test_set_value_checks_permission@example.com",
+			first_name="Set Value",
+			send_welcome_email=0,
+			roles=[{"role": "Report Manager"}],
+		).insert(ignore_permissions=True)
+
+		with self.set_user(user.name):
+			own = frappe.get_doc(doctype="ToDo", description="test_set_value_checks_permission").insert()
+			frappe.db.set_value("ToDo", own.name, "priority", "High", check_permission=True)
+
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.db.set_value,
+				"ToDo",
+				other.name,
+				"priority",
+				"High",
+				check_permission=True,
+			)
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.db.bulk_update,
+				"ToDo",
+				{own.name: {"priority": "Low"}, other.name: {"priority": "Low"}},
+				check_permission=True,
+			)
+			# a missing document is not told apart from a denied one
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.db.set_value,
+				"ToDo",
+				"does-not-exist",
+				"priority",
+				"High",
+				check_permission=True,
+			)
+			self.assertRaises(
+				frappe.ValidationError,
+				frappe.db.set_value,
+				"ToDo",
+				own.name,
+				"owner",
+				"Administrator",
+				check_permission=True,
+			)
+
+		self.assertEqual(frappe.db.get_value("ToDo", own.name, ["priority", "owner"]), ("High", user.name))
+		self.assertEqual(frappe.db.get_value("ToDo", other.name, "priority"), "Medium")
+
+	def test_set_single_value_checks_permission_and_saves_version(self):
+		user = frappe.get_doc(
+			doctype="User",
+			email="test_set_single_value_checks_permission@example.com",
+			first_name="Set Single Value",
+			send_welcome_email=0,
+			roles=[{"role": "Report Manager"}],
+		).insert(ignore_permissions=True)
+		title_prefix = frappe.db.get_single_value("Website Settings", "title_prefix")
+
+		with self.set_user(user.name):
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.db.set_single_value,
+				"Website Settings",
+				"title_prefix",
+				"test_set_single_value",
+				check_permission=True,
+			)
+
+		self.assertEqual(frappe.db.get_single_value("Website Settings", "title_prefix"), title_prefix)
+
+		# the deprecated single DocType call must forward the flags
+		frappe.db.set_value(  # nosemgrep
+			"Website Settings",
+			"Website Settings",
+			"title_prefix",
+			"test_set_single_value",
+			check_permission=True,
+			save_version=True,
+		)
+
+		data = frappe.db.get_value(
+			"Version",
+			{"ref_doctype": "Website Settings", "docname": "Website Settings"},
+			"data",
+			order_by="creation desc",
+		)
+		self.assertEqual(
+			frappe.parse_json(data)["changed"][0][::2], ["title_prefix", "test_set_single_value"]
+		)
+
 	def test_cleared_cache(self):
 		self.todo2.reload()
 		frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)  # init cache

@@ -38,6 +38,7 @@ from frappe.query_builder.functions import Count
 from frappe.utils import (
 	CallbackManager,
 	cint,
+	cstr,
 	get_datetime,
 	get_system_timezone,
 	get_table_name,
@@ -868,18 +869,35 @@ class Database:
 		modified_by=None,
 		update_modified=True,
 		debug=False,
+		check_permission: bool = False,
+		save_version: bool = False,
+		updater_reference: dict | None = None,
 	):
 		"""Set field value of Single DocType.
 
 		:param doctype: DocType of the single object
 		:param fieldname: `fieldname` of the property
 		:param value: `value` of the property
+		:param check_permission: Throw unless the user may write these fields. A permission check only:
+		        validations are not run, as with any `frappe.db` write.
+		:param save_version: Record the change on the timeline, as `Document.save` does.
+		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 
 		Example:
 
 		        # Update the `deny_multiple_sessions` field in System Settings DocType.
 		        frappe.db.set_single_value("System Settings", "deny_multiple_sessions", True)
 		"""
+
+		versions = []
+		if check_permission or save_version:
+			versions = self._prepare_tracked_update(
+				doctype,
+				{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
+				check_permission,
+				save_version,
+				updater_reference,
+			)
 
 		to_update = self._get_update_dict(
 			fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
@@ -892,6 +910,11 @@ class Database:
 		singles_data = ((doctype, key, sbool(value)) for key, value in to_update.items())
 		frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(debug=debug)
 		frappe.clear_document_cache(doctype, doctype)
+
+		if versions:
+			from frappe.model.document import bulk_insert
+
+			bulk_insert("Version", versions)
 
 	def get_single_value(
 		self,
@@ -959,6 +982,10 @@ class Database:
 		modified_by=None,
 		update_modified=True,
 		debug=False,
+		*,
+		check_permission: bool = False,
+		save_version: bool = False,
+		updater_reference: dict | None = None,
 	):
 		"""Set a single value in the database, do not call the ORM triggers
 		but update the modified timestamp (unless specified not to).
@@ -973,12 +1000,17 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Set as false, if you don't want to update the timestamp.
 		:param debug: Print the query in the developer / js console.
+		:param check_permission: Throw unless the user may write these fields of each document. A permission
+		        check only: docstatus, `allow_on_submit` and validations are not applied, as with any `frappe.db` write.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does.
+		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 		"""
 		from frappe.model.utils import is_single_doctype
 
 		if dn is None or dt == dn:
 			if not is_single_doctype(dt):
 				return
+
 			from frappe.deprecation_dumpster import deprecation_warning
 
 			deprecation_warning(
@@ -994,8 +1026,29 @@ class Database:
 				update_modified=update_modified,
 				modified=modified,
 				modified_by=modified_by,
+				check_permission=check_permission,
+				save_version=save_version,
+				updater_reference=updater_reference,
 			)
 			return
+
+		names = None
+		versions = []
+		if check_permission or save_version:
+			names = (
+				[convert_to_value(dn)]
+				if isinstance(dn, FilterValue)
+				else self.get_all(dt, filters=dn, pluck="name")
+			)
+			if not names:
+				return
+
+			values = field if isinstance(field, dict) else {field: val}
+			versions = self._prepare_tracked_update(
+				dt, dict.fromkeys(names, values), check_permission, save_version, updater_reference
+			)
+			# write only the documents that were checked
+			dn = {"name": ("in", names)}
 
 		to_update = self._get_update_dict(
 			field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
@@ -1007,7 +1060,9 @@ class Database:
 			update=True,
 		)
 
-		if isinstance(dn, FilterValue):
+		if names is not None:
+			frappe.clear_document_cache(dt, names)
+		elif isinstance(dn, FilterValue):
 			frappe.clear_document_cache(dt, convert_to_value(dn))
 		else:
 			# No way to guess which documents are modified, clear all of them
@@ -1017,6 +1072,11 @@ class Database:
 			query = query.set(column, value)
 
 		query.run(debug=debug)
+
+		if versions:
+			from frappe.model.document import bulk_insert
+
+			bulk_insert("Version", versions)
 
 	def bulk_update(
 		self,
@@ -1028,6 +1088,9 @@ class Database:
 		modified_by: str | None = None,
 		update_modified: bool = True,
 		debug: bool = False,
+		check_permission: bool = False,
+		save_version: bool = False,
+		updater_reference: dict | None = None,
 	):
 		"""
 		:param doctype: DocType to update
@@ -1037,6 +1100,11 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Update `modified` and `modified_by` fields
 		:param debug: Print the query in the developer / js console.
+		:param check_permission: Throw, and write nothing, unless the user may write these fields of each document.
+		        A permission check only: docstatus, `allow_on_submit` and validations are not applied, as with any
+		        `frappe.db` write.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does.
+		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 
 		doc_updates should be in the following format:
 		```py
@@ -1061,6 +1129,12 @@ class Database:
 		if not doc_updates:
 			return
 
+		versions = []
+		if check_permission or save_version:
+			versions = self._prepare_tracked_update(
+				doctype, doc_updates, check_permission, save_version, updater_reference
+			)
+
 		modified_dict = None
 		if update_modified:
 			modified_dict = self._get_update_dict(
@@ -1073,6 +1147,80 @@ class Database:
 		for __ in range(0, total_docs, chunk_size):
 			doc_chunk = dict(itertools.islice(iterator, chunk_size))
 			self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
+
+		frappe.clear_document_cache(doctype, list(doc_updates))
+
+		if versions:
+			from frappe.model.document import bulk_insert
+
+			bulk_insert("Version", versions)
+
+	def _prepare_tracked_update(
+		self,
+		doctype: str,
+		doc_updates: dict,
+		check_permission: bool,
+		save_version: bool,
+		updater_reference: dict | None,
+	) -> list:
+		"""Check the user may write `doc_updates`, and return the Versions to save for them."""
+		from frappe.model import default_fields
+		from frappe.permissions import get_permitted_docs
+
+		meta = frappe.get_meta(doctype)
+		if meta.istable:
+			frappe.throw(_("{0} is a Child DocType").format(frappe.bold(_(doctype))))
+
+		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
+
+		if check_permission:
+			if fieldnames.intersection(default_fields):
+				frappe.throw(_("Cannot edit standard fields"))
+
+			if restricted := fieldnames.difference(meta.get_permitted_fieldnames(permission_type="write")):
+				frappe.throw(
+					_("No permission to update {0} in {1}").format(
+						frappe.bold(", ".join(meta.get_label(fieldname) for fieldname in sorted(restricted))),
+						_(doctype),
+					),
+					frappe.PermissionError,
+				)
+
+			if meta.issingle:
+				denied = [] if frappe.has_permission(doctype, "write") else [doctype]
+			else:
+				# names are compared as stored (int or str), as get_permitted_docs returns them
+				permitted = {cstr(name) for name in get_permitted_docs(doctype, doc_updates, "write")}
+				denied = [name for name in doc_updates if cstr(name) not in permitted]
+
+			if denied:
+				frappe.throw(
+					_("No permission for {0}").format(f"{_(doctype)} {denied[0]}"), frappe.PermissionError
+				)
+
+		if not save_version:
+			return []
+
+		if meta.issingle:
+			values = self.get_singles_dict(doctype, cast=True)
+			old_rows = [_dict(name=doctype, **{fieldname: values.get(fieldname) for fieldname in fieldnames})]
+		else:
+			old_rows = self.get_all(
+				doctype, filters={"name": ("in", list(doc_updates))}, fields=["name", *fieldnames]
+			)
+
+		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
+		versions = []
+		for old_row in old_rows:
+			doc = frappe.get_doc({**old_row, **doc_updates[cstr(old_row.name)], "doctype": doctype})
+			doc._doc_before_save = frappe.get_doc({**old_row, "doctype": doctype})
+			doc.flags.updater_reference = updater_reference
+
+			if version := doc._get_version():
+				version.set_new_name()
+				versions.append(version)
+
+		return versions
 
 	@staticmethod
 	def _build_and_run_bulk_update_query(
