@@ -1141,15 +1141,20 @@ class Database:
 			return []
 
 		meta = frappe.get_meta(doctype)
+		# rows of a child DocType are recorded on their parents, which decide
+		if not meta.istable and not meta.track_changes:
+			return []
+
 		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
 
-		# parent documents of the rows of a child DocType, by parent DocType
+		# parent documents of the rows of a child DocType, by parent DocType that tracks changes
 		parents = {}
 		if meta.istable:
 			for row in self.get_all(
 				doctype, filters={"name": ("in", list(doc_updates))}, fields=["parent", "parenttype"]
 			):
-				parents.setdefault(row.parenttype, set()).add(row.parent)
+				if frappe.get_meta(row.parenttype).track_changes:
+					parents.setdefault(row.parenttype, set()).add(row.parent)
 
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
 
