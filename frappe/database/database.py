@@ -880,7 +880,8 @@ class Database:
 		:param value: `value` of the property
 		:param check_permission: Throw unless the user may write these fields. A permission check only:
 		        validations are not run, as with any `frappe.db` write.
-		:param save_version: Record the change on the timeline, as `Document.save` does.
+		:param save_version: Record the change on the timeline, as `Document.save` does. Versions are inserted
+		        in bulk, without Version's document events, and no realtime update is published.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 
 		Example:
@@ -1002,7 +1003,9 @@ class Database:
 		:param debug: Print the query in the developer / js console.
 		:param check_permission: Throw unless the user may write these fields of each document. A permission
 		        check only: docstatus, `allow_on_submit` and validations are not applied, as with any `frappe.db` write.
-		:param save_version: Record the change on each document's timeline, as `Document.save` does.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
+		        inserted in bulk, without Version's document events, and no realtime update is published.
+		        Rows of a child DocType are checked through, and recorded on, their parent documents.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 		"""
 		from frappe.model.utils import is_single_doctype
@@ -1103,7 +1106,9 @@ class Database:
 		:param check_permission: Throw, and write nothing, unless the user may write these fields of each document.
 		        A permission check only: docstatus, `allow_on_submit` and validations are not applied, as with any
 		        `frappe.db` write.
-		:param save_version: Record the change on each document's timeline, as `Document.save` does.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
+		        inserted in bulk, without Version's document events, and no realtime update is published.
+		        Rows of a child DocType are checked through, and recorded on, their parent documents.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 
 		doc_updates should be in the following format:
@@ -1163,28 +1168,44 @@ class Database:
 		save_version: bool,
 		updater_reference: dict | None,
 	) -> list:
-		"""Check the user may write `doc_updates`, and return the Versions to save for them."""
-		from frappe.model import default_fields
+		"""Check the user may write `doc_updates`, and return the Versions to save for them.
+
+		Rows of a child DocType are checked through their parent documents, as `has_permission` checks
+		them; the parents' cache is cleared and the change recorded on their timeline, as `Document.save`
+		records it.
+		"""
+		from frappe.model import child_table_fields, default_fields
 		from frappe.permissions import get_permitted_docs
 
 		meta = frappe.get_meta(doctype)
-		if meta.istable:
-			frappe.throw(_("{0} is a Child DocType").format(frappe.bold(_(doctype))))
-
 		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
 
+		# parent documents of the rows of a child DocType, by parent DocType
+		parents = {}
+		if meta.istable:
+			for row in self.get_all(
+				doctype, filters={"name": ("in", list(doc_updates))}, fields=["parent", "parenttype"]
+			):
+				parents.setdefault(row.parenttype, set()).add(row.parent)
+
 		if check_permission:
-			if fieldnames.intersection(default_fields):
+			if fieldnames.intersection((*default_fields, *child_table_fields)):
 				frappe.throw(_("Cannot edit standard fields"))
 
-			if restricted := fieldnames.difference(meta.get_permitted_fieldnames(permission_type="write")):
-				frappe.throw(
-					_("No permission to update {0} in {1}").format(
-						frappe.bold(", ".join(meta.get_label(fieldname) for fieldname in sorted(restricted))),
-						_(doctype),
-					),
-					frappe.PermissionError,
-				)
+			# the permlevels of a child DocType are those of its parent
+			for parenttype in parents or (None,):
+				if restricted := fieldnames.difference(
+					meta.get_permitted_fieldnames(parenttype, permission_type="write")
+				):
+					frappe.throw(
+						_("No permission to update {0} in {1}").format(
+							frappe.bold(
+								", ".join(meta.get_label(fieldname) for fieldname in sorted(restricted))
+							),
+							_(doctype),
+						),
+						frappe.PermissionError,
+					)
 
 			if meta.issingle:
 				denied = [] if frappe.has_permission(doctype, "write") else [doctype]
@@ -1198,22 +1219,56 @@ class Database:
 					_("No permission for {0}").format(f"{_(doctype)} {denied[0]}"), frappe.PermissionError
 				)
 
+		# a cached document holds its rows
+		for parenttype, parent_names in parents.items():
+			frappe.clear_document_cache(parenttype, parent_names)
+
 		if not save_version:
 			return []
 
-		if meta.issingle:
-			values = self.get_singles_dict(doctype, cast=True)
-			old_rows = [_dict(name=doctype, **{fieldname: values.get(fieldname) for fieldname in fieldnames})]
-		else:
-			old_rows = self.get_all(
-				doctype, filters={"name": ("in", list(doc_updates))}, fields=["name", *fieldnames]
-			)
-
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
+
+		# each document as it is, and as it will be
+		if meta.istable:
+			# every row of the parent, in order, so that a row is recorded at its index
+			documents = {}
+			for parenttype, parent_names in parents.items():
+				for row in self.get_all(
+					doctype,
+					filters={"parent": ("in", list(parent_names)), "parenttype": parenttype},
+					fields=["name", "parent", "parentfield", "idx", *fieldnames],
+					order_by="idx asc",
+				):
+					old, new = documents.setdefault(
+						(parenttype, row.parent),
+						(
+							{"doctype": parenttype, "name": row.parent},
+							{"doctype": parenttype, "name": row.parent},
+						),
+					)
+					old.setdefault(row.parentfield, []).append(row)
+					new.setdefault(row.parentfield, []).append({**row, **doc_updates.get(row.name, {})})
+			documents = documents.values()
+		else:
+			if meta.issingle:
+				values = self.get_singles_dict(doctype, cast=True)
+				old_rows = [
+					_dict(name=doctype, **{fieldname: values.get(fieldname) for fieldname in fieldnames})
+				]
+			else:
+				old_rows = self.get_all(
+					doctype, filters={"name": ("in", list(doc_updates))}, fields=["name", *fieldnames]
+				)
+
+			documents = [
+				({**row, "doctype": doctype}, {**row, **doc_updates[cstr(row.name)], "doctype": doctype})
+				for row in old_rows
+			]
+
 		versions = []
-		for old_row in old_rows:
-			doc = frappe.get_doc({**old_row, **doc_updates[cstr(old_row.name)], "doctype": doctype})
-			doc._doc_before_save = frappe.get_doc({**old_row, "doctype": doctype})
+		for old, new in documents:
+			doc = frappe.get_doc(new)
+			doc._doc_before_save = frappe.get_doc(old)
 			doc.flags.updater_reference = updater_reference
 
 			if version := doc._get_version():

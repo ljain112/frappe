@@ -447,25 +447,43 @@ class TestPermissions(IntegrationTestCase):
 		child.insert()
 		self.addCleanup(child.delete)
 		parent = new_doctype(
-			fields=[{"label": "Rows", "fieldname": "rows", "fieldtype": "Table", "options": child.name}],
-			permissions=[{"role": "Blogger", "read": 1, "write": 1}, {"role": "System Manager", "read": 1}],
+			fields=[
+				{"label": "Rows", "fieldname": "rows", "fieldtype": "Table", "options": child.name},
+				{
+					"label": "Restricted Rows",
+					"fieldname": "restricted_rows",
+					"fieldtype": "Table",
+					"options": child.name,
+					"permlevel": 1,
+				},
+			],
+			permissions=[
+				{"role": "Blogger", "read": 1, "write": 1},
+				{"role": "Blogger", "permlevel": 1, "read": 1},
+				{"role": "System Manager", "read": 1},
+			],
 		)
 		parent.insert()
 		self.addCleanup(parent.delete)
-		records = [
-			frappe.get_doc({"doctype": parent.name, "rows": rows}).insert().name
-			for rows in (
-				[{"category": "_Test Blog Category 1"}],
-				[{"category": "_Test Blog Category 1"}, {"category": "_Test Blog Category"}],
-				[{}],
-				[],
-			)
-		]
+		with self.set_user("Administrator"):
+			records = [
+				frappe.get_doc({"doctype": parent.name, **tables}).insert()
+				for tables in (
+					{"rows": [{"category": "_Test Blog Category 1"}]},
+					{"rows": [{"category": "_Test Blog Category 1"}, {"category": "_Test Blog Category"}]},
+					{"rows": [{}]},
+					{"restricted_rows": [{"category": "_Test Blog Category 1"}]},
+				)
+			]
+		rows = [row.name for record in records for row in (*record.rows, *record.restricted_rows)]
+		records = [record.name for record in records]
 
 		documents = {
 			"Test Blog Post": posts,
 			"ToDo": [*todos, "_Test Missing ToDo"],
 			parent.name: [*records, "_Test Missing Record"],
+			# rows are permitted through their parent, their table and its permlevel
+			child.name: [*rows, "_Test Missing Row"],
 		}
 
 		def assert_same_as_has_permission():
@@ -495,6 +513,34 @@ class TestPermissions(IntegrationTestCase):
 							msg=(doctype, user, ptype),
 						)
 
+		assert_same_as_has_permission()
+
+		orphan = frappe.get_doc(
+			{
+				"doctype": child.name,
+				"parent": "_Test Missing Record",
+				"parenttype": parent.name,
+				"parentfield": "rows",
+			}
+		)
+		orphan.db_insert()
+		self.assertEqual(get_permitted_docs(child.name, [orphan.name], "read", "test1@example.com"), [])
+		self.assertEqual(
+			get_permitted_docs(child.name, [orphan.name], "read", "Administrator"), [orphan.name]
+		)
+		frappe.db.delete(child.name, orphan.name)
+
+		# a row whose parentfield is not one of its parent's tables is denied, and compared from here on
+		stray = frappe.get_doc(
+			{
+				"doctype": child.name,
+				"parent": records[0],
+				"parenttype": parent.name,
+				"parentfield": "stray_rows",
+			}
+		)
+		stray.db_insert()
+		documents[child.name].append(stray.name)
 		assert_same_as_has_permission()
 
 		# a `has_permission` hook may read child rows, so they are read for it without User Permissions too

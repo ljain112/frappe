@@ -104,6 +104,9 @@ def has_permission(
 	                which explains why the permission check failed.
 	:param parent_doctype:
 	        Required when checking permission for a child DocType (unless doc is specified)
+
+	`get_permitted_docs` answers the same for many documents at once. A check added here, or a change
+	to the order of the checks, must be made there too; its tests compare the two.
 	"""
 
 	if not user:
@@ -244,7 +247,10 @@ def get_permitted_docs(
 	child table where User Permissions or a `has_permission` hook need the child rows.
 	Missing documents are left out, as `frappe.get_list` leaves them out.
 
-	:param doctype: DocType of the documents. Single and child DocTypes are not supported.
+	Rows of a child DocType are permitted through their parent documents, as `has_child_permission`
+	permits them; rows whose parent is missing are left out.
+
+	:param doctype: DocType of the documents. Single DocTypes are not supported.
 	:param names: Names of the documents to check. Returned as stored: `int` for an
 	        autoincrement DocType, `str` otherwise.
 	:param ptype: Permission type to check. Default: `read`.
@@ -258,8 +264,8 @@ def get_permitted_docs(
 
 	meta = frappe.get_meta(doctype)
 
-	if meta.issingle or meta.istable:
-		frappe.throw(_("{0} is a Single or Child DocType").format(frappe.bold(_(doctype))))
+	if meta.issingle:
+		frappe.throw(_("{0} is a Single DocType").format(frappe.bold(_(doctype))))
 
 	# the database compares `name = 123` with the stored '123'; the lookup below is by the stored value
 	names = list(dict.fromkeys((cint if is_autoincremented(doctype, meta) else cstr)(name) for name in names))
@@ -272,6 +278,49 @@ def get_permitted_docs(
 	if user == "Administrator":
 		# has_permission allows Administrator before it reads the document, the module or the shares
 		return names
+
+	if meta.istable:
+		# as has_child_permission: the row's table must be one of its parent's, permitted at its permlevel,
+		# and the parent document permitted
+		tables = {}
+		for name in names:
+			tables.setdefault((rows[name].parenttype, rows[name].parentfield), []).append(name)
+
+		permitted = set()
+		for (parenttype, parentfield), table_rows in tables.items():
+			if not parenttype:
+				continue
+
+			parent_meta = frappe.get_meta(parenttype)
+			table_field = next(
+				(
+					df
+					for df in parent_meta.get_table_fields(include_computed=True)
+					if df.fieldname == parentfield and df.options == doctype
+				),
+				None,
+			)
+			if parent_meta.istable or not table_field:
+				continue
+
+			if table_field.permlevel > 0 and table_field.permlevel not in parent_meta.get_permlevel_access(
+				"read" if ptype == "select" else ptype, user=user
+			):
+				continue
+
+			parents = {rows[name].parent for name in table_rows}
+			if parent_meta.issingle:
+				permitted_parents = (
+					parents if has_permission(parenttype, ptype, user=user, print_logs=False) else ()
+				)
+			else:
+				permitted_parents = {
+					cstr(parent) for parent in get_permitted_docs(parenttype, parents, ptype, user)
+				}
+
+			permitted.update(name for name in table_rows if rows[name].parent in permitted_parents)
+
+		return [name for name in names if name in permitted]
 
 	table_fields = meta.get_table_fields()
 	hooks = frappe.get_hooks("has_permission")

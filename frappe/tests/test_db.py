@@ -2059,6 +2059,125 @@ class TestDBSetValue(IntegrationTestCase):
 			frappe.parse_json(data)["changed"][0][::2], ["title_prefix", "test_set_single_value"]
 		)
 
+	def test_set_value_on_rows_records_on_their_parent(self):
+		sidebars = [
+			frappe.get_doc(
+				doctype="Website Sidebar",
+				title=f"test_set_value_on_rows {i}",
+				sidebar_items=[{"title": "a"}, {"title": "b"}],
+			).insert()
+			for i in range(3)
+		]
+		frappe.get_cached_doc("Website Sidebar", sidebars[1].name)
+
+		# the same change as Document.save records it (which skips Versions in tests unless asked)
+		sidebars[0].sidebar_items[1].title = "b2"
+		sidebars[0].save(ignore_version=False)
+
+		frappe.db.bulk_update(
+			"Website Sidebar Item",
+			{
+				sidebars[1].sidebar_items[1].name: {"title": "b2"},
+				sidebars[2].sidebar_items[0].name: {"title": "a2"},
+			},
+			save_version=True,
+		)
+
+		row_changed = {
+			docname: frappe.parse_json(data)["row_changed"]
+			for docname, data in frappe.get_all(
+				"Version",
+				filters={"ref_doctype": "Website Sidebar", "docname": ("in", [s.name for s in sidebars])},
+				fields=["docname", "data"],
+				as_list=True,
+			)
+		}
+		self.assertEqual(
+			row_changed[sidebars[1].name],
+			[
+				[fieldname, idx, sidebars[1].sidebar_items[1].name, changed]
+				for fieldname, idx, __, changed in row_changed[sidebars[0].name]
+			],
+		)
+		self.assertEqual(
+			row_changed[sidebars[2].name],
+			[["sidebar_items", 0, sidebars[2].sidebar_items[0].name, [["title", "a", "a2"]]]],
+		)
+		self.assertEqual(
+			frappe.get_cached_doc("Website Sidebar", sidebars[1].name).sidebar_items[1].title, "b2"
+		)
+
+		# rows of two tables of one child DocType, on one Version
+		workspace = frappe.get_doc(
+			doctype="Custom Workspace",
+			workspace=frappe.get_all("Workspace", {"standard": 1}, pluck="name", limit=1)[0],
+			added_roles=[{"role": "Guest"}],
+			removed_roles=[{"role": "Guest"}],
+		).insert()
+		frappe.db.bulk_update(
+			"Has Role",
+			{
+				workspace.added_roles[0].name: {"role": "Desk User"},
+				workspace.removed_roles[0].name: {"role": "System Manager"},
+			},
+			save_version=True,
+		)
+		data = frappe.db.get_value(
+			"Version", {"ref_doctype": "Custom Workspace", "docname": workspace.name}, "data"
+		)
+		self.assertEqual(
+			frappe.parse_json(data)["row_changed"],
+			[
+				["added_roles", 0, workspace.added_roles[0].name, [["role", "Guest", "Desk User"]]],
+				["removed_roles", 0, workspace.removed_roles[0].name, [["role", "Guest", "System Manager"]]],
+			],
+		)
+
+	def test_set_value_on_rows_checks_their_parent(self):
+		sidebar = frappe.get_doc(
+			doctype="Website Sidebar", title="test_set_value_on_rows_checks", sidebar_items=[{"title": "a"}]
+		).insert()
+		row = sidebar.sidebar_items[0].name
+		users = [
+			frappe.get_doc(
+				doctype="User",
+				email=f"test_set_value_on_rows_{role.lower().replace(' ', '_')}@example.com",
+				first_name="Set Value On Rows",
+				send_welcome_email=0,
+				roles=[{"role": role}],
+			).insert(ignore_permissions=True)
+			for role in ("Report Manager", "Website Manager")
+		]
+
+		with self.set_user(users[0].name):
+			self.assertFalse(frappe.has_permission("Website Sidebar Item", "write", doc=row))
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.db.set_value,
+				"Website Sidebar Item",
+				row,
+				"title",
+				"b",
+				check_permission=True,
+			)
+			self.assertRaises(
+				frappe.ValidationError,
+				frappe.db.set_value,
+				"Website Sidebar Item",
+				row,
+				"parent",
+				"other",
+				check_permission=True,
+			)
+
+		with self.set_user(users[1].name):
+			self.assertTrue(frappe.has_permission("Website Sidebar Item", "write", doc=row))
+			frappe.db.set_value("Website Sidebar Item", row, "title", "c", check_permission=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Website Sidebar Item", row, ["title", "parent"]), ("c", sidebar.name)
+		)
+
 	def test_cleared_cache(self):
 		self.todo2.reload()
 		frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)  # init cache
