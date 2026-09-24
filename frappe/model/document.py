@@ -248,6 +248,56 @@ def get_docs(
 	return list(iterator)
 
 
+def get_docs_by_name(
+	doctype: str, names: Iterable[str | int], *, lazy: bool = False
+) -> dict[str | int, "Document"]:
+	"""Load the named documents in bulk, by name as stored, in the order given.
+
+	The documents are loaded as `get_docs` loads them, or with `lazy`, as `get_lazy_doc` loads them: their
+	child tables on first access. Rows of a child DocType are loaded within their parent documents, which
+	they hold as `parent_doc`. Missing documents, and rows that no parent document holds, are left out.
+	"""
+	from frappe.model.naming import is_autoincremented
+
+	meta = frappe.get_meta(doctype)
+	# the database compares `name = 123` with the stored '123'; the documents are keyed by the stored value
+	names = list(dict.fromkeys((cint if is_autoincremented(doctype, meta) else cstr)(name) for name in names))
+	if not names:
+		return {}
+
+	if meta.issingle:
+		return (
+			{doctype: (get_lazy_doc if lazy else frappe.get_doc)(doctype, doctype)}
+			if doctype in names
+			else {}
+		)
+
+	if meta.istable:
+		parents = {}
+		for row in frappe.get_all(doctype, filters={"name": ("in", names)}, fields=["parent", "parenttype"]):
+			if row.parenttype:
+				parents.setdefault(row.parenttype, []).append(row.parent)
+
+		docs = {}
+		for parenttype, parent_names in parents.items():
+			# the parents' tables hold the rows
+			for parent in get_docs_by_name(parenttype, parent_names).values():
+				for row in parent.get_all_children(doctype):
+					row.parent_doc = parent  # held strongly, so the parent lives as long as the row
+					docs[row.name] = row
+
+	elif lazy:
+		controller = get_lazy_controller(doctype)
+		docs = {
+			row.name: controller({**row, "doctype": doctype})
+			for row in frappe.get_all(doctype, filters={"name": ("in", names)}, fields=["*"], order_by=None)
+		}
+	else:
+		docs = {doc.name: doc for doc in get_docs(doctype, filters={"name": ("in", names)}, order_by=None)}
+
+	return {name: docs[name] for name in names if name in docs}
+
+
 def _get_docs_generator(
 	doctype,
 	controller,
@@ -277,6 +327,9 @@ def _get_docs_generator(
 		if not chunk_data:
 			break
 		yield from _build_document_objects(controller, chunk_data, for_update)
+		if len(chunk_data) < chunk_size:
+			# a short chunk is the last one
+			break
 		offset += chunk_size
 
 
