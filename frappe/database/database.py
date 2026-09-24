@@ -9,7 +9,7 @@ import string
 import traceback
 import warnings
 from collections.abc import Iterable, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from time import time
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -869,7 +869,6 @@ class Database:
 		modified_by=None,
 		update_modified=True,
 		debug=False,
-		check_permission: bool = False,
 		save_version: bool = False,
 		updater_reference: dict | None = None,
 	):
@@ -878,8 +877,6 @@ class Database:
 		:param doctype: DocType of the single object
 		:param fieldname: `fieldname` of the property
 		:param value: `value` of the property
-		:param check_permission: Throw unless the user may write these fields. A permission check only:
-		        validations are not run, as with any `frappe.db` write.
 		:param save_version: Record the change on the timeline, as `Document.save` does. Versions are inserted
 		        in bulk, without Version's document events, and no realtime update is published.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
@@ -890,12 +887,14 @@ class Database:
 		        frappe.db.set_single_value("System Settings", "deny_multiple_sessions", True)
 		"""
 
-		with self._tracked_update(
-			doctype,
-			{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
-			check_permission,
-			save_version,
-			updater_reference,
+		with (
+			self._tracked_update(
+				doctype,
+				{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
+				updater_reference,
+			)
+			if save_version
+			else nullcontext()
 		):
 			to_update = self._get_update_dict(
 				fieldname, value, modified=modified, modified_by=modified_by, update_modified=update_modified
@@ -978,7 +977,6 @@ class Database:
 		update_modified=True,
 		debug=False,
 		*,
-		check_permission: bool = False,
 		save_version: bool = False,
 		updater_reference: dict | None = None,
 	):
@@ -995,11 +993,9 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Set as false, if you don't want to update the timestamp.
 		:param debug: Print the query in the developer / js console.
-		:param check_permission: Throw unless the user may write these fields of each document. A permission
-		        check only: docstatus, `allow_on_submit` and validations are not applied, as with any `frappe.db` write.
 		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
 		        inserted in bulk, without Version's document events, and no realtime update is published.
-		        Rows of a child DocType are checked through, and recorded on, their parent documents.
+		        Rows of a child DocType are recorded on their parent documents.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 		"""
 		from frappe.model.utils import is_single_doctype
@@ -1023,14 +1019,13 @@ class Database:
 				update_modified=update_modified,
 				modified=modified,
 				modified_by=modified_by,
-				check_permission=check_permission,
 				save_version=save_version,
 				updater_reference=updater_reference,
 			)
 			return
 
 		doc_updates = {}
-		if check_permission or save_version:
+		if save_version:
 			names = (
 				[convert_to_value(dn)]
 				if isinstance(dn, FilterValue)
@@ -1040,10 +1035,10 @@ class Database:
 				return
 
 			doc_updates = dict.fromkeys(names, field if isinstance(field, dict) else {field: val})
-			# write only the documents that were checked
+			# write only the documents that are recorded
 			dn = {"name": ("in", names)}
 
-		with self._tracked_update(dt, doc_updates, check_permission, save_version, updater_reference):
+		with self._tracked_update(dt, doc_updates, updater_reference) if save_version else nullcontext():
 			to_update = self._get_update_dict(
 				field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
 			)
@@ -1077,7 +1072,6 @@ class Database:
 		modified_by: str | None = None,
 		update_modified: bool = True,
 		debug: bool = False,
-		check_permission: bool = False,
 		save_version: bool = False,
 		updater_reference: dict | None = None,
 	):
@@ -1089,12 +1083,9 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Update `modified` and `modified_by` fields
 		:param debug: Print the query in the developer / js console.
-		:param check_permission: Throw, and write nothing, unless the user may write these fields of each document.
-		        A permission check only: docstatus, `allow_on_submit` and validations are not applied, as with any
-		        `frappe.db` write.
 		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
 		        inserted in bulk, without Version's document events, and no realtime update is published.
-		        Rows of a child DocType are checked through, and recorded on, their parent documents.
+		        Rows of a child DocType are recorded on their parent documents.
 		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
 
 		doc_updates should be in the following format:
@@ -1120,7 +1111,7 @@ class Database:
 		if not doc_updates:
 			return
 
-		with self._tracked_update(doctype, doc_updates, check_permission, save_version, updater_reference):
+		with self._tracked_update(doctype, doc_updates, updater_reference) if save_version else nullcontext():
 			modified_dict = None
 			if update_modified:
 				modified_dict = self._get_update_dict(
@@ -1137,27 +1128,13 @@ class Database:
 			frappe.clear_document_cache(doctype, list(doc_updates))
 
 	@contextmanager
-	def _tracked_update(
-		self,
-		doctype: str,
-		doc_updates: dict,
-		check_permission: bool,
-		save_version: bool,
-		updater_reference: dict | None,
-	):
-		"""Around a write of `doc_updates`: check the user may make it, and record it on the timeline.
+	def _tracked_update(self, doctype: str, doc_updates: dict, updater_reference: dict | None):
+		"""Around a write of `doc_updates`: record it on the timeline, as `Document.save` does.
 
-		`has_permission` decides, as it does for `Document.save`, and `Document._get_version` records.
-		Rows of a child DocType are checked through, and recorded on, their parent documents, which are
-		cleared from the cache.
+		`Document._get_version` records the change. Rows of a child DocType are recorded on their parent
+		documents, which are cleared from the cache.
 		"""
-		if not (check_permission or save_version):
-			yield
-			return
-
-		from frappe.model import child_table_fields, default_fields
 		from frappe.model.document import bulk_insert
-		from frappe.permissions import get_permitted_docs
 
 		meta = frappe.get_meta(doctype)
 		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
@@ -1170,39 +1147,9 @@ class Database:
 			):
 				parents.setdefault(row.parenttype, set()).add(row.parent)
 
-		if check_permission:
-			if fieldnames.intersection((*default_fields, *child_table_fields)):
-				frappe.throw(_("Cannot edit standard fields"))
-
-			# the permlevels of a child DocType are those of its parent
-			for parenttype in parents or (None,):
-				if restricted := fieldnames.difference(
-					meta.get_permitted_fieldnames(parenttype, permission_type="write")
-				):
-					frappe.throw(
-						_("No permission to update {0} in {1}").format(
-							frappe.bold(
-								", ".join(meta.get_label(fieldname) for fieldname in sorted(restricted))
-							),
-							_(doctype),
-						),
-						frappe.PermissionError,
-					)
-
-			# names are compared as stored (int or str), as get_permitted_docs returns them
-			permitted = {cstr(name) for name in get_permitted_docs(doctype, doc_updates, "write")}
-			if denied := [name for name in doc_updates if cstr(name) not in permitted]:
-				frappe.throw(
-					_("No permission for {0}").format(f"{_(doctype)} {denied[0]}"), frappe.PermissionError
-				)
-
 		# a cached document holds its rows
 		for parenttype, parent_names in parents.items():
 			frappe.clear_document_cache(parenttype, parent_names)
-
-		if not save_version:
-			yield
-			return
 
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
 

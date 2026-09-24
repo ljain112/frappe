@@ -1964,88 +1964,13 @@ class TestDBSetValue(IntegrationTestCase):
 			data = frappe.db.get_value("Version", {"ref_doctype": "ToDo", "docname": todo.name}, "data")
 			self.assertEqual(frappe.parse_json(data)["changed"], [["priority", "Low", "High"]])
 
-	def test_set_value_checks_permission(self):
-		other = frappe.get_doc(doctype="ToDo", description="test_set_value_checks_permission").insert()
-		user = frappe.get_doc(
-			doctype="User",
-			email="test_set_value_checks_permission@example.com",
-			first_name="Set Value",
-			send_welcome_email=0,
-			roles=[{"role": "Report Manager"}],
-		).insert(ignore_permissions=True)
-
-		with self.set_user(user.name):
-			own = frappe.get_doc(doctype="ToDo", description="test_set_value_checks_permission").insert()
-			frappe.db.set_value("ToDo", own.name, "priority", "High", check_permission=True)
-
-			self.assertRaises(
-				frappe.PermissionError,
-				frappe.db.set_value,
-				"ToDo",
-				other.name,
-				"priority",
-				"High",
-				check_permission=True,
-			)
-			self.assertRaises(
-				frappe.PermissionError,
-				frappe.db.bulk_update,
-				"ToDo",
-				{own.name: {"priority": "Low"}, other.name: {"priority": "Low"}},
-				check_permission=True,
-			)
-			# a missing document is not told apart from a denied one
-			self.assertRaises(
-				frappe.PermissionError,
-				frappe.db.set_value,
-				"ToDo",
-				"does-not-exist",
-				"priority",
-				"High",
-				check_permission=True,
-			)
-			self.assertRaises(
-				frappe.ValidationError,
-				frappe.db.set_value,
-				"ToDo",
-				own.name,
-				"owner",
-				"Administrator",
-				check_permission=True,
-			)
-
-		self.assertEqual(frappe.db.get_value("ToDo", own.name, ["priority", "owner"]), ("High", user.name))
-		self.assertEqual(frappe.db.get_value("ToDo", other.name, "priority"), "Medium")
-
-	def test_set_single_value_checks_permission_and_saves_version(self):
-		user = frappe.get_doc(
-			doctype="User",
-			email="test_set_single_value_checks_permission@example.com",
-			first_name="Set Single Value",
-			send_welcome_email=0,
-			roles=[{"role": "Report Manager"}],
-		).insert(ignore_permissions=True)
-		title_prefix = frappe.db.get_single_value("Website Settings", "title_prefix")
-
-		with self.set_user(user.name):
-			self.assertRaises(
-				frappe.PermissionError,
-				frappe.db.set_single_value,
-				"Website Settings",
-				"title_prefix",
-				"test_set_single_value",
-				check_permission=True,
-			)
-
-		self.assertEqual(frappe.db.get_single_value("Website Settings", "title_prefix"), title_prefix)
-
+	def test_set_single_value_saves_version(self):
 		# the deprecated single DocType call must forward the flags
 		frappe.db.set_value(  # nosemgrep
 			"Website Settings",
 			"Website Settings",
 			"title_prefix",
 			"test_set_single_value",
-			check_permission=True,
 			save_version=True,
 		)
 
@@ -2131,51 +2056,6 @@ class TestDBSetValue(IntegrationTestCase):
 				["added_roles", 0, workspace.added_roles[0].name, [["role", "Guest", "Desk User"]]],
 				["removed_roles", 0, workspace.removed_roles[0].name, [["role", "Guest", "System Manager"]]],
 			],
-		)
-
-	def test_set_value_on_rows_checks_their_parent(self):
-		sidebar = frappe.get_doc(
-			doctype="Website Sidebar", title="test_set_value_on_rows_checks", sidebar_items=[{"title": "a"}]
-		).insert()
-		row = sidebar.sidebar_items[0].name
-		users = [
-			frappe.get_doc(
-				doctype="User",
-				email=f"test_set_value_on_rows_{role.lower().replace(' ', '_')}@example.com",
-				first_name="Set Value On Rows",
-				send_welcome_email=0,
-				roles=[{"role": role}],
-			).insert(ignore_permissions=True)
-			for role in ("Report Manager", "Website Manager")
-		]
-
-		with self.set_user(users[0].name):
-			self.assertFalse(frappe.has_permission("Website Sidebar Item", "write", doc=row))
-			self.assertRaises(
-				frappe.PermissionError,
-				frappe.db.set_value,
-				"Website Sidebar Item",
-				row,
-				"title",
-				"b",
-				check_permission=True,
-			)
-			self.assertRaises(
-				frappe.ValidationError,
-				frappe.db.set_value,
-				"Website Sidebar Item",
-				row,
-				"parent",
-				"other",
-				check_permission=True,
-			)
-
-		with self.set_user(users[1].name):
-			self.assertTrue(frappe.has_permission("Website Sidebar Item", "write", doc=row))
-			frappe.db.set_value("Website Sidebar Item", row, "title", "c", check_permission=True)
-
-		self.assertEqual(
-			frappe.db.get_value("Website Sidebar Item", row, ["title", "parent"]), ("c", sidebar.name)
 		)
 
 	def test_cleared_cache(self):
