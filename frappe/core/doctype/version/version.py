@@ -28,13 +28,18 @@ class Version(Document):
 		ref_doctype: DF.Link
 	# end: auto-generated types
 
-	def update_version_info(self, old: Document | None, new: Document) -> bool:
-		"""Update changed info and return true if change contains useful data."""
+	def update_version_info(
+		self, old: Document | None, new: Document, *, fieldnames: set[str] | None = None
+	) -> bool:
+		"""Update changed info and return true if change contains useful data.
+
+		:param fieldnames: Compare only these fields (and, in child rows, their fields), where only they can differ.
+		"""
 		if not old:
 			# Check if doc has some information about creation source like data import
 			return self.for_insert(new)
 		else:
-			return self.set_diff(old, new)
+			return self.set_diff(old, new, fieldnames=fieldnames)
 
 	@staticmethod
 	def set_impersonator(data):
@@ -46,9 +51,9 @@ class Version(Document):
 		if audit_user := frappe.session.data.get("audit_user"):
 			data["audit_user"] = audit_user
 
-	def set_diff(self, old: Document, new: Document) -> bool:
+	def set_diff(self, old: Document, new: Document, *, fieldnames: set[str] | None = None) -> bool:
 		"""Set the data property with the diff of the docs if present"""
-		diff = get_diff(old, new, include_ignored_fields=False)
+		diff = get_diff(old, new, include_ignored_fields=False, fieldnames=fieldnames)
 		if diff:
 			self.set_impersonator(diff)
 			self.ref_doctype = new.doctype
@@ -101,8 +106,13 @@ class Version(Document):
 			self.set_onload("html_diffs", html_diffs)
 
 
-def get_diff(old, new, for_child=False, compare_cancelled=False, include_ignored_fields=True):
+def get_diff(
+	old, new, for_child=False, compare_cancelled=False, include_ignored_fields=True, *, fieldnames=None
+):
 	"""Get diff between 2 document objects
+
+	`fieldnames` limits the comparison to those fields, in the document and in its child rows, for a
+	caller that knows no other field can differ.
 
 	If there is a change, then returns a dict like:
 
@@ -156,6 +166,9 @@ def get_diff(old, new, for_child=False, compare_cancelled=False, include_ignored
 		old_row_name_field = "_amended_from" if (amended_from and amended_from == old.name) else "name"
 
 	for df in new.meta.fields:
+		if fieldnames is not None and df.fieldname not in fieldnames:
+			continue
+
 		if df.fieldtype in FIELDTYPES_TO_IGNORE or getattr(df, "is_virtual", False):
 			continue
 
@@ -193,6 +206,7 @@ def get_diff(old, new, for_child=False, compare_cancelled=False, include_ignored
 						d,
 						for_child=True,
 						include_ignored_fields=include_ignored_fields,
+						fieldnames=fieldnames,
 					)
 					if diff and diff.changed:
 						out.row_changed.append((df.fieldname, i, d.name, diff.changed))

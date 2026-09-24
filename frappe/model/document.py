@@ -1983,9 +1983,10 @@ class Document(BaseDocument):
 		:param update_modified: default True. updates the `modified` and `modified_by` properties
 		:param notify: default False. run doc.notify_update() to send updates via socketio
 		:param commit: default False. run frappe.db.commit()
-		:param save_version: Record the change on the timeline, as `frappe.db.set_value` does. Within the
-		        save of this document (or of the parent of this row), the save records it instead.
-		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
+		:param save_version: Record the change on the timeline, as `frappe.db.set_value` does, if the DocType
+		        tracks changes. Within the save of this document (or of the parent of this row), the save
+		        records it.
+		:param updater_reference: With `save_version`, `{"doctype", "docname", "label"}` of what made the change.
 		"""
 		if isinstance(fieldname, dict):
 			self.update(fieldname)
@@ -2061,8 +2062,11 @@ class Document(BaseDocument):
 		if version := self._get_version():
 			version.insert(ignore_permissions=True)
 
-	def _get_version(self) -> "Document | None":
-		"""Return the unsaved Version that records this change, or None where none is due."""
+	def _get_version(self, *, fieldnames: set[str] | None = None) -> "Document | None":
+		"""Return the unsaved Version that records this change, or None where none is due.
+
+		:param fieldnames: Compare only these fields, where only they can differ.
+		"""
 
 		# don't track version under following conditions
 		if (
@@ -2082,7 +2086,7 @@ class Document(BaseDocument):
 			return None
 
 		version = frappe.new_doc("Version")
-		if version.update_version_info(doc_to_compare, self):
+		if version.update_version_info(doc_to_compare, self, fieldnames=fieldnames):
 			return version
 
 		return None

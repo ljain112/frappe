@@ -646,7 +646,7 @@ class TestDocument(IntegrationTestCase):
 	def test_db_set_on_a_row_saves_version_on_its_parent(self):
 		sidebar = frappe.get_doc(
 			doctype="Website Sidebar",
-			title="test_db_set_on_a_row",
+			title=f"test_db_set_on_a_row {frappe.generate_hash(length=8)}",
 			sidebar_items=[{"title": "a"}, {"title": "b"}],
 		).insert()
 
@@ -696,7 +696,7 @@ class TestDocument(IntegrationTestCase):
 
 		sidebar = frappe.get_doc(
 			doctype="Website Sidebar",
-			title="test_db_set_on_a_row_within_save",
+			title=f"test_db_set_on_a_row_within_save {frappe.generate_hash(length=8)}",
 			sidebar_items=[{"title": "a"}, {"title": "b"}],
 		).insert()
 

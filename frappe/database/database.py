@@ -877,9 +877,10 @@ class Database:
 		:param doctype: DocType of the single object
 		:param fieldname: `fieldname` of the property
 		:param value: `value` of the property
-		:param save_version: Record the change on the timeline, as `Document.save` does. Versions are inserted
-		        in bulk, without Version's document events, and no realtime update is published.
-		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
+		:param save_version: Record the change on the timeline, as `Document.save` does, if the DocType tracks
+		        changes. Versions are inserted in bulk, without Version's document events, and no realtime update
+		        is published.
+		:param updater_reference: With `save_version`, `{"doctype", "docname", "label"}` of what made the change.
 
 		Example:
 
@@ -993,10 +994,10 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Set as false, if you don't want to update the timestamp.
 		:param debug: Print the query in the developer / js console.
-		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
-		        inserted in bulk, without Version's document events, and no realtime update is published.
-		        Rows of a child DocType are recorded on their parent documents.
-		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does, if the
+		        DocType tracks changes. Versions are inserted in bulk, without Version's document events, and no
+		        realtime update is published. Rows of a child DocType are recorded on their parent documents.
+		:param updater_reference: With `save_version`, `{"doctype", "docname", "label"}` of what made the change.
 		"""
 		from frappe.model.utils import is_single_doctype
 
@@ -1083,10 +1084,10 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Update `modified` and `modified_by` fields
 		:param debug: Print the query in the developer / js console.
-		:param save_version: Record the change on each document's timeline, as `Document.save` does. Versions are
-		        inserted in bulk, without Version's document events, and no realtime update is published.
-		        Rows of a child DocType are recorded on their parent documents.
-		:param updater_reference: `{"doctype", "docname", "label"}` of what made the change, for the timeline.
+		:param save_version: Record the change on each document's timeline, as `Document.save` does, if the
+		        DocType tracks changes. Versions are inserted in bulk, without Version's document events, and no
+		        realtime update is published. Rows of a child DocType are recorded on their parent documents.
+		:param updater_reference: With `save_version`, `{"doctype", "docname", "label"}` of what made the change.
 
 		doc_updates should be in the following format:
 		```py
@@ -1153,10 +1154,11 @@ class Database:
 
 		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
 
-		# each document as it is, and as it will be
+		# each document as it is, and as it will be, holding only what can differ
 		if meta.istable:
 			# every row of the parent, in order, so that a row is recorded at its index
 			documents = {}
+			tables = set()
 			for parenttype, parent_names in parents.items():
 				for row in self.get_all(
 					doctype,
@@ -1173,7 +1175,10 @@ class Database:
 					)
 					old.setdefault(row.parentfield, []).append(row)
 					new.setdefault(row.parentfield, []).append({**row, **doc_updates.get(row.name, {})})
+					tables.add(row.parentfield)
 			documents = documents.values()
+			# the diff walks the tables of the parent to the fields of its rows
+			fieldnames = fieldnames | tables
 		else:
 			if meta.issingle:
 				values = self.get_singles_dict(doctype, cast=True)
@@ -1196,7 +1201,7 @@ class Database:
 			doc._doc_before_save = frappe.get_doc(old)
 			doc.flags.updater_reference = updater_reference
 
-			if version := doc._get_version():
+			if version := doc._get_version(fieldnames=fieldnames):
 				version.set_new_name()
 				versions.append(version)
 
