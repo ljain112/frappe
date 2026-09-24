@@ -2068,12 +2068,12 @@ class Document(BaseDocument):
 		:param fieldnames: Compare only these fields, where only they can differ.
 		"""
 
+		from frappe.core.doctype.version.version import tracks_changes
+
 		# don't track version under following conditions
 		if (
-			not getattr(self.meta, "track_changes", False)
-			or self.doctype == "Version"
+			not tracks_changes(self.meta)
 			or self.flags.ignore_version
-			or frappe.flags.in_install
 			or (not self._doc_before_save and frappe.flags.in_patch)
 		):
 			return None

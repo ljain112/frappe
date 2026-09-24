@@ -38,7 +38,6 @@ from frappe.query_builder.functions import Count
 from frappe.utils import (
 	CallbackManager,
 	cint,
-	cstr,
 	get_datetime,
 	get_system_timezone,
 	get_table_name,
@@ -888,11 +887,16 @@ class Database:
 		        frappe.db.set_single_value("System Settings", "deny_multiple_sessions", True)
 		"""
 
-		versions = self._prepare_versions(
-			doctype,
-			{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
-			save_version,
-			updater_reference,
+		from frappe.core.doctype.version.version import insert_versions, prepare_versions
+
+		versions = (
+			prepare_versions(
+				doctype,
+				{doctype: fieldname if isinstance(fieldname, dict) else {fieldname: value}},
+				updater_reference,
+			)
+			if save_version
+			else []
 		)
 
 		to_update = self._get_update_dict(
@@ -907,7 +911,7 @@ class Database:
 		frappe.qb.into("Singles").columns("doctype", "field", "value").insert(*singles_data).run(debug=debug)
 		frappe.clear_document_cache(doctype, doctype)
 
-		self._insert_versions(versions)
+		insert_versions(versions)
 
 	def get_single_value(
 		self,
@@ -1038,7 +1042,9 @@ class Database:
 				# write only the documents that are recorded
 				dn = {"name": ("in", names)}
 
-		versions = self._prepare_versions(dt, doc_updates, save_version, updater_reference)
+		from frappe.core.doctype.version.version import insert_versions, prepare_versions
+
+		versions = prepare_versions(dt, doc_updates, updater_reference) if save_version else []
 
 		to_update = self._get_update_dict(
 			field, val, modified=modified, modified_by=modified_by, update_modified=update_modified
@@ -1061,7 +1067,7 @@ class Database:
 
 		query.run(debug=debug)
 
-		self._insert_versions(versions)
+		insert_versions(versions)
 
 	def bulk_update(
 		self,
@@ -1112,7 +1118,9 @@ class Database:
 		if not doc_updates:
 			return
 
-		versions = self._prepare_versions(doctype, doc_updates, save_version, updater_reference)
+		from frappe.core.doctype.version.version import insert_versions, prepare_versions
+
+		versions = prepare_versions(doctype, doc_updates, updater_reference) if save_version else []
 
 		modified_dict = None
 		if update_modified:
@@ -1127,97 +1135,7 @@ class Database:
 			doc_chunk = dict(itertools.islice(iterator, chunk_size))
 			self._build_and_run_bulk_update_query(doctype, doc_chunk, modified_dict, debug)
 
-		self._insert_versions(versions)
-
-	def _prepare_versions(
-		self, doctype: str, doc_updates: dict, save_version: bool, updater_reference: dict | None
-	) -> list:
-		"""Return the Versions that record `doc_updates` on the timeline, as `Document.save` does.
-
-		Call before the write, which changes the values read here; insert them after it. Rows of a child
-		DocType are recorded on their parent documents.
-		"""
-		if not save_version:
-			return []
-
-		meta = frappe.get_meta(doctype)
-		# rows of a child DocType are recorded on their parents, which decide
-		if not meta.istable and not meta.track_changes:
-			return []
-
-		fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
-
-		# parent documents of the rows of a child DocType, by parent DocType that tracks changes
-		parents = {}
-		if meta.istable:
-			for row in self.get_all(
-				doctype, filters={"name": ("in", list(doc_updates))}, fields=["parent", "parenttype"]
-			):
-				if frappe.get_meta(row.parenttype).track_changes:
-					parents.setdefault(row.parenttype, set()).add(row.parent)
-
-		doc_updates = {cstr(name): values for name, values in doc_updates.items()}
-
-		# each document as it is, and as it will be, holding only what can differ
-		if meta.istable:
-			# every row of the parent, in order, so that a row is recorded at its index
-			documents = {}
-			tables = set()
-			for parenttype, parent_names in parents.items():
-				for row in self.get_all(
-					doctype,
-					filters={"parent": ("in", list(parent_names)), "parenttype": parenttype},
-					fields=["name", "parent", "parentfield", "idx", *fieldnames],
-					order_by="idx asc",
-				):
-					old, new = documents.setdefault(
-						(parenttype, row.parent),
-						(
-							{"doctype": parenttype, "name": row.parent},
-							{"doctype": parenttype, "name": row.parent},
-						),
-					)
-					old.setdefault(row.parentfield, []).append(row)
-					new.setdefault(row.parentfield, []).append({**row, **doc_updates.get(row.name, {})})
-					tables.add(row.parentfield)
-			documents = documents.values()
-			# the diff walks the tables of the parent to the fields of its rows
-			fieldnames = fieldnames | tables
-		else:
-			if meta.issingle:
-				values = self.get_singles_dict(doctype, cast=True)
-				old_rows = [
-					_dict(name=doctype, **{fieldname: values.get(fieldname) for fieldname in fieldnames})
-				]
-			else:
-				old_rows = self.get_all(
-					doctype, filters={"name": ("in", list(doc_updates))}, fields=["name", *fieldnames]
-				)
-
-			documents = [
-				({**row, "doctype": doctype}, {**row, **doc_updates[cstr(row.name)], "doctype": doctype})
-				for row in old_rows
-			]
-
-		versions = []
-		for old, new in documents:
-			doc = frappe.get_doc(new)
-			doc._doc_before_save = frappe.get_doc(old)
-			doc.flags.updater_reference = updater_reference
-
-			if version := doc._get_version(fieldnames=fieldnames):
-				version.set_new_name()
-				versions.append(version)
-
-		return versions
-
-	@staticmethod
-	def _insert_versions(versions: list):
-		"""Insert the Versions from `_prepare_versions`, after the write they record."""
-		if versions:
-			from frappe.model.document import bulk_insert
-
-			bulk_insert("Version", versions)
+		insert_versions(versions)
 
 	@staticmethod
 	def _build_and_run_bulk_update_query(

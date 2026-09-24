@@ -6,7 +6,7 @@ import json
 
 import frappe
 from frappe.model import datetime_fields, no_value_fields, table_fields
-from frappe.model.document import Document
+from frappe.model.document import Document, bulk_insert, get_lazy_controller
 from frappe.utils import cstr
 
 FIELDTYPES_TO_IGNORE = frozenset(fieldtype for fieldtype in no_value_fields if fieldtype not in table_fields)
@@ -297,3 +297,100 @@ def _should_generate_html_diff(old_str: str, new_str: str) -> bool:
 def _as_string(value: str | None) -> str:
 	"""Convert the given value to a string."""
 	return cstr(value) if value is not None else ""
+
+
+def tracks_changes(meta) -> bool:
+	"""Whether changes to documents of this DocType are recorded as Versions (`Document._get_version` asks too)."""
+	return (
+		bool(getattr(meta, "track_changes", False)) and meta.name != "Version" and not frappe.flags.in_install
+	)
+
+
+def prepare_versions(doctype: str, doc_updates: dict, updater_reference: dict | None = None) -> list[Version]:
+	"""Return the unsaved Versions that record `doc_updates` to `doctype`, as `Document.save` records them.
+
+	For a write made without the documents (`frappe.db.set_value`, `bulk_update`): call it before the write,
+	which changes the values read here, and `insert_versions` after. Each document is read whole, in one
+	query, as a lazy document, so the diff and its formatting see every field, and its child tables load
+	only if read. Rows of a child DocType are recorded on their parent documents.
+
+	:param doc_updates: `{name: {fieldname: value}}`
+	:param updater_reference: `{"doctype", "docname", "label"}` of what made the change.
+	"""
+	meta = frappe.get_meta(doctype)
+	# rows of a child DocType are recorded on their parents, which decide
+	if not meta.istable and not tracks_changes(meta):
+		return []
+
+	doc_updates = {cstr(name): values for name, values in doc_updates.items()}
+	fieldnames = {fieldname for values in doc_updates.values() for fieldname in values}
+
+	def whole_rows(doctype, meta, names):
+		if meta.issingle:
+			return [frappe._dict(frappe.db.get_singles_dict(doctype, cast=True), name=doctype)]
+		return frappe.get_all(doctype, filters={"name": ("in", list(names))}, fields=["*"])
+
+	documents = []  # (as it is, as it will be)
+	if meta.istable:
+		parents = {}
+		for row in frappe.get_all(
+			doctype, filters={"name": ("in", list(doc_updates))}, fields=["parent", "parenttype"]
+		):
+			if tracks_changes(frappe.get_meta(row.parenttype)):
+				parents.setdefault(row.parenttype, set()).add(row.parent)
+
+		for parenttype, parent_names in parents.items():
+			# the tables that hold the rows, whole and in order, so that a row is recorded at its index
+			parent_meta = frappe.get_meta(parenttype)
+			table_fieldnames = [
+				df.fieldname for df in parent_meta.get_table_fields() if df.options == doctype
+			]
+			fieldnames |= set(table_fieldnames)  # the diff walks these tables to the fields of their rows
+			tables = {}
+			for row in frappe.get_all(
+				doctype,
+				filters={"parent": ("in", list(parent_names)), "parenttype": parenttype},
+				fields=["*"],
+				order_by="idx asc",
+			):
+				tables.setdefault((row.parent, row.parentfield), []).append(row)
+
+			controller = get_lazy_controller(parenttype)
+			for parent in whole_rows(parenttype, parent_meta, parent_names):
+				rows = {f: tables.get((parent.name, f), []) for f in table_fieldnames}
+				documents.append(
+					(
+						controller({**parent, "doctype": parenttype, **rows}),
+						controller(
+							{
+								**parent,
+								"doctype": parenttype,
+								**{
+									f: [{**row, **doc_updates.get(row.name, {})} for row in table]
+									for f, table in rows.items()
+								},
+							}
+						),
+					)
+				)
+	else:
+		controller = get_lazy_controller(doctype)
+		for row in whole_rows(doctype, meta, doc_updates):
+			updated = {**row, **doc_updates[cstr(row.name)], "doctype": doctype}
+			documents.append((controller({**row, "doctype": doctype}), controller(updated)))
+
+	versions = []
+	for before, after in documents:
+		after._doc_before_save = before
+		after.flags.updater_reference = updater_reference
+		if version := after._get_version(fieldnames=fieldnames):
+			version.set_new_name()
+			versions.append(version)
+
+	return versions
+
+
+def insert_versions(versions: list[Version]) -> None:
+	"""Insert, in one query, the Versions from `prepare_versions`, after the write they record."""
+	if versions:
+		bulk_insert("Version", versions)

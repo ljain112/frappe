@@ -663,15 +663,15 @@ class TestDocument(IntegrationTestCase):
 	def test_db_set_singles_saves_version(self):
 		# a fresh value: this class commits (its DocTypes are created with DDL), so a fixed one may already be set
 		value = f"test_db_set_singles_saves_version {frappe.generate_hash(length=8)}"
-		frappe.get_doc("Website Settings").db_set("title_prefix", value, save_version=True)
+		frappe.get_doc("About Us Settings").db_set("page_title", value, save_version=True)
 
 		data = frappe.db.get_value(
 			"Version",
-			{"ref_doctype": "Website Settings", "docname": "Website Settings"},
+			{"ref_doctype": "About Us Settings", "docname": "About Us Settings"},
 			"data",
 			order_by="creation desc",
 		)
-		self.assertEqual(frappe.parse_json(data)["changed"][0][::2], ["title_prefix", value])
+		self.assertEqual(frappe.parse_json(data)["changed"][0][::2], ["page_title", value])
 
 	def test_db_set_within_its_own_save_is_recorded_by_the_save(self):
 		todo = frappe.get_doc(doctype="ToDo", description="test_db_set_within_save", priority="Low").insert()

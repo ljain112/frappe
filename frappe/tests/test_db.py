@@ -2081,6 +2081,34 @@ class TestDBSetValue(IntegrationTestCase):
 			self.assertEqual(data["updater_reference"], {"label": "via test"})
 			self.assertEqual(frappe.get_cached_doc("ToDo", todo.name).get(changed[0][0]), changed[0][2])
 
+	def test_set_value_on_an_untracked_doctype_records_nothing(self):
+		self.assertFalse(frappe.get_meta("Tag").track_changes)
+		tag = frappe.get_doc(doctype="Tag", description="a").insert(set_name=frappe.generate_hash(length=10))
+
+		# only the write, as without the flag
+		with self.assertQueryCount(1):
+			frappe.db.set_value("Tag", tag.name, "description", "b", save_version=True)
+
+		self.assertFalse(frappe.db.exists("Version", {"ref_doctype": "Tag", "docname": tag.name}))
+
+	def test_cleared_cache(self):
+		self.todo2.reload()
+		frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)  # init cache
+
+		description = f"{self.todo2.description}-edit by `test_cleared_cache`"
+
+		frappe.db.set_value(self.todo2.doctype, self.todo2.name, "description", description)
+		cached_doc = frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)
+		self.assertEqual(cached_doc.description, description)
+
+	@classmethod
+	def tearDownClass(cls):
+		frappe.db.rollback()
+
+
+class TestDBSetValueOnNewDocType(IntegrationTestCase):
+	"""Creating a DocType commits, so these stay out of `TestDBSetValue`, whose fixtures would persist."""
+
 	def test_set_value_records_a_currency_field_in_the_document_currency(self):
 		from frappe.core.doctype.doctype.test_doctype import new_doctype
 		from frappe.utils import fmt_money
@@ -2093,8 +2121,9 @@ class TestDBSetValue(IntegrationTestCase):
 			track_changes=1,
 		).insert()
 		self.addCleanup(frappe.db.commit)
-		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "tab{doctype.name}" CASCADE')
+		self.addCleanup(frappe.db.sql_ddl, f"DROP TABLE IF EXISTS `tab{doctype.name}`")
 		self.addCleanup(doctype.delete)
+		self.addCleanup(frappe.db.delete, "Version", {"ref_doctype": doctype.name})
 		docs = [frappe.get_doc(doctype=doctype.name, currency="USD", amount=100).insert() for _ in range(2)]
 
 		# the same change as Document.save records it
@@ -2112,36 +2141,6 @@ class TestDBSetValue(IntegrationTestCase):
 			changed[0], [["amount", fmt_money(100, currency="USD"), fmt_money(50, currency="USD")]]
 		)
 		self.assertEqual(changed[1], changed[0])
-
-	def test_set_value_on_an_untracked_doctype_records_nothing(self):
-		from frappe.core.doctype.doctype.test_doctype import new_doctype
-
-		doctype = new_doctype().insert()
-		self.addCleanup(frappe.db.commit)
-		self.addCleanup(frappe.db.sql_ddl, f'DROP TABLE IF EXISTS "tab{doctype.name}" CASCADE')
-		self.addCleanup(doctype.delete)
-		doc = frappe.get_doc(doctype=doctype.name, some_fieldname="a").insert()
-		frappe.get_meta(doctype.name)
-
-		# only the write, as without the flag
-		with self.assertQueryCount(1):
-			frappe.db.set_value(doctype.name, doc.name, "some_fieldname", "b", save_version=True)
-
-		self.assertFalse(frappe.db.exists("Version", {"ref_doctype": doctype.name, "docname": doc.name}))
-
-	def test_cleared_cache(self):
-		self.todo2.reload()
-		frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)  # init cache
-
-		description = f"{self.todo2.description}-edit by `test_cleared_cache`"
-
-		frappe.db.set_value(self.todo2.doctype, self.todo2.name, "description", description)
-		cached_doc = frappe.get_cached_doc(self.todo2.doctype, self.todo2.name)
-		self.assertEqual(cached_doc.description, description)
-
-	@classmethod
-	def tearDownClass(cls):
-		frappe.db.rollback()
 
 
 @run_only_if(db_type_is.POSTGRES)
