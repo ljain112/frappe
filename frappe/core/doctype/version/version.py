@@ -6,7 +6,7 @@ import json
 
 import frappe
 from frappe.model import datetime_fields, no_value_fields, table_fields
-from frappe.model.document import Document, bulk_insert, get_lazy_controller
+from frappe.model.document import Document, bulk_insert
 from frappe.utils import cstr
 
 FIELDTYPES_TO_IGNORE = frozenset(fieldtype for fieldtype in no_value_fields if fieldtype not in table_fields)
@@ -311,8 +311,8 @@ def prepare_versions(doctype: str, doc_updates: dict, updater_reference: dict | 
 
 	For a write made without the documents (`frappe.db.set_value`, `bulk_update`): call it before the write,
 	which changes the values read here, and `insert_versions` after. Each document is read whole, in one
-	query, as a lazy document, so the diff and its formatting see every field, and its child tables load
-	only if read. Rows of a child DocType are recorded on their parent documents.
+	query, so the diff and its formatting see every field; of its child tables, it holds only those with
+	the updated rows. Rows of a child DocType are recorded on their parent documents.
 
 	:param doc_updates: `{name: {fieldname: value}}`
 	:param updater_reference: `{"doctype", "docname", "label"}` of what made the change.
@@ -355,13 +355,12 @@ def prepare_versions(doctype: str, doc_updates: dict, updater_reference: dict | 
 			):
 				tables.setdefault((row.parent, row.parentfield), []).append(row)
 
-			controller = get_lazy_controller(parenttype)
 			for parent in whole_rows(parenttype, parent_meta, parent_names):
 				rows = {f: tables.get((parent.name, f), []) for f in table_fieldnames}
 				documents.append(
 					(
-						controller({**parent, "doctype": parenttype, **rows}),
-						controller(
+						frappe.get_doc({**parent, "doctype": parenttype, **rows}),
+						frappe.get_doc(
 							{
 								**parent,
 								"doctype": parenttype,
@@ -374,10 +373,9 @@ def prepare_versions(doctype: str, doc_updates: dict, updater_reference: dict | 
 					)
 				)
 	else:
-		controller = get_lazy_controller(doctype)
 		for row in whole_rows(doctype, meta, doc_updates):
 			updated = {**row, **doc_updates[cstr(row.name)], "doctype": doctype}
-			documents.append((controller({**row, "doctype": doctype}), controller(updated)))
+			documents.append((frappe.get_doc({**row, "doctype": doctype}), frappe.get_doc(updated)))
 
 	versions = []
 	for before, after in documents:
