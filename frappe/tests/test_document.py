@@ -160,6 +160,67 @@ class TestDocument(IntegrationTestCase):
 		link.save()
 		self.assertEqual(link.row_value, "new")
 
+	def test_empty_fetch_from_value_not_written_to_empty_data_field_after_submit(self):
+		source = new_doctype(
+			fields=[
+				{"fieldtype": "Data", "fieldname": "some_fieldname", "label": "Some Field"},
+				{"fieldtype": "Int", "fieldname": "some_int", "label": "Some Int"},
+			]
+		).insert()
+		target = new_doctype(
+			is_submittable=1,
+			fields=[
+				{
+					"fieldtype": "Link",
+					"options": source.name,
+					"fieldname": "source",
+					"label": "Source",
+					"allow_on_submit": 1,
+				},
+				{
+					"fieldtype": "Data",
+					"fieldname": "source_value",
+					"label": "Source Value",
+					"fetch_from": "source.some_fieldname",
+					"fetch_if_empty": 1,
+					"allow_on_submit": 1,
+				},
+				{
+					"fieldtype": "Data",
+					"fieldname": "source_int",
+					"label": "Source Int",
+					"fetch_from": "source.some_int",
+					"fetch_if_empty": 1,
+					"allow_on_submit": 1,
+				},
+			],
+		).insert()
+
+		source_doc = frappe.get_doc({"doctype": source.name}).insert()
+		doc = frappe.get_doc({"doctype": target.name, "source": source_doc.name}).insert()
+		doc.submit()
+
+		source_doc.some_fieldname = ""
+		source_doc.save()
+		self.assertEqual(frappe.db.get_value(source.name, source_doc.name, "some_fieldname"), "")
+
+		doc.reload()
+		doc.save()
+		self.assertFalse(doc.has_value_changed("source_value"))
+		self.assertIsNone(frappe.db.get_value(target.name, doc.name, "source_value"))
+
+		linked_after_submit = frappe.get_doc({"doctype": target.name}).insert()
+		linked_after_submit.submit()
+		linked_after_submit.source = source_doc.name
+		linked_after_submit.save()
+		self.assertEqual(frappe.db.get_value(target.name, linked_after_submit.name, "source_int"), "0")
+
+		source_doc.some_fieldname = "filled"
+		source_doc.save()
+		doc.reload()
+		doc.save()
+		self.assertEqual(doc.source_value, "filled")
+
 	def test_insert_with_child(self):
 		d = frappe.get_doc(
 			{
