@@ -160,11 +160,13 @@ class TestDocument(IntegrationTestCase):
 		link.save()
 		self.assertEqual(link.row_value, "new")
 
-	def test_empty_fetch_from_value_not_written_to_empty_data_field_after_submit(self):
+	def test_empty_fetch_from_value_not_written_over_empty_field(self):
 		source = new_doctype(
 			fields=[
 				{"fieldtype": "Data", "fieldname": "some_fieldname", "label": "Some Field"},
 				{"fieldtype": "Int", "fieldname": "some_int", "label": "Some Int"},
+				{"fieldtype": "Small Text", "fieldname": "some_text", "label": "Some Text"},
+				{"fieldtype": "Link", "options": "User", "fieldname": "some_user", "label": "Some User"},
 			]
 		).insert()
 		target = new_doctype(
@@ -193,21 +195,42 @@ class TestDocument(IntegrationTestCase):
 					"fetch_if_empty": 1,
 					"allow_on_submit": 1,
 				},
+				{
+					"fieldtype": "Small Text",
+					"fieldname": "source_text",
+					"label": "Source Text",
+					"fetch_from": "source.some_text",
+					"allow_on_submit": 1,
+				},
+				{
+					"fieldtype": "Link",
+					"options": "User",
+					"fieldname": "source_user",
+					"label": "Source User",
+					"fetch_from": "source.some_user",
+					"allow_on_submit": 1,
+				},
 			],
 		).insert()
+		blank_fields = ("source_value", "source_text", "source_user")
 
 		source_doc = frappe.get_doc({"doctype": source.name}).insert()
 		doc = frappe.get_doc({"doctype": target.name, "source": source_doc.name}).insert()
 		doc.submit()
 
-		source_doc.some_fieldname = ""
+		source_doc.update({"some_fieldname": "", "some_text": "", "some_user": ""})
 		source_doc.save()
 		self.assertEqual(frappe.db.get_value(source.name, source_doc.name, "some_fieldname"), "")
 
+		draft = frappe.get_doc({"doctype": target.name, "source": source_doc.name}).insert()
+		draft.save()
 		doc.reload()
 		doc.save()
-		self.assertFalse(doc.has_value_changed("source_value"))
-		self.assertIsNone(frappe.db.get_value(target.name, doc.name, "source_value"))
+		for fieldname in blank_fields:
+			self.assertFalse(doc.has_value_changed(fieldname))
+			self.assertFalse(draft.has_value_changed(fieldname))
+			self.assertIsNone(frappe.db.get_value(target.name, doc.name, fieldname))
+			self.assertIsNone(frappe.db.get_value(target.name, draft.name, fieldname))
 
 		linked_after_submit = frappe.get_doc({"doctype": target.name}).insert()
 		linked_after_submit.submit()

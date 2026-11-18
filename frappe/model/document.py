@@ -3742,12 +3742,7 @@ class Document(_DocumentBase):
 			if fetch_from_ft == "Text Editor" and value:
 				value = unescape_html(strip_html(value))
 
-		if (
-			df.fieldtype == "Data"
-			and self.docstatus.is_submitted()
-			and value in (None, "")
-			and self.get(df.fieldname) in (None, "")
-		):
+		if value in (None, "") and self.get(df.fieldname) in (None, ""):
 			return
 
 		setattr(self, df.fieldname, value)
